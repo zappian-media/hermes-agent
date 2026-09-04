@@ -670,6 +670,75 @@ class TestRunJobSessionPersistence:
         assert "file" in (kwargs["enabled_toolsets"] or [])
         assert "memory" not in kwargs["disabled_toolsets"]
 
+    def test_run_job_native_memory_opt_out_forces_skip_memory(self, tmp_path):
+        """cron.native_memory_enabled: false opts cron agents out of native memory.
+
+        The job is silent about memory: the scheduler forces skip_memory=True
+        and strips memory from the platform-resolved enabled toolsets, so no
+        cron agent forks native memory (SPEC-2026-002 no-double-writer rule).
+        """
+        (tmp_path / "config.yaml").write_text("cron:\n  native_memory_enabled: false\n")
+        job = {
+            "id": "native-memory-optout-job",
+            "name": "test",
+            "prompt": "hello",
+        }
+        with self._run_job_patches(tmp_path) as (fake_db, mock_agent_cls):
+            run_job(job)
+
+        kwargs = mock_agent_cls.call_args.kwargs
+        assert kwargs["skip_memory"] is True
+        assert "memory" not in (kwargs["enabled_toolsets"] or [])
+        # The rest of platform toolset resolution is untouched.
+        assert "file" in (kwargs["enabled_toolsets"] or [])
+
+    def test_run_job_native_memory_opt_out_denies_per_job_memory_toolset(self, tmp_path):
+        """The opt-out wins over a per-job enabled_toolsets naming memory.
+
+        memory is stripped from the effective enabled toolsets AND
+        skip_memory=True, closing the _memory_toolset_requested re-widening
+        path in agent init (E11).
+        """
+        (tmp_path / "config.yaml").write_text("cron:\n  native_memory_enabled: false\n")
+        job = {
+            "id": "native-memory-optout-explicit-job",
+            "name": "test",
+            "prompt": "remember what you learn",
+            "enabled_toolsets": ["memory", "file"],
+        }
+        with self._run_job_patches(tmp_path) as (fake_db, mock_agent_cls):
+            run_job(job)
+
+        kwargs = mock_agent_cls.call_args.kwargs
+        assert kwargs["skip_memory"] is True
+        assert "memory" not in (kwargs["enabled_toolsets"] or [])
+        assert "file" in (kwargs["enabled_toolsets"] or [])
+
+    def test_run_job_native_memory_opt_out_never_loads_memory_store(self, tmp_path):
+        """With the opt-out, AIAgent construction from cron never calls
+        MemoryStore.load_from_disk — even for a job that names memory."""
+        (tmp_path / "config.yaml").write_text("cron:\n  native_memory_enabled: false\n")
+        job = {
+            "id": "native-memory-optout-no-load-job",
+            "name": "test",
+            "prompt": "remember what you learn",
+            "enabled_toolsets": ["memory", "file"],
+        }
+        # Bound BEFORE entering the patch context: _run_job_patches swaps
+        # run_agent.AIAgent for a mock, so an import inside the block would
+        # bind the mock instead of the real class.
+        from run_agent import AIAgent as RealAIAgent
+
+        with self._run_job_patches(tmp_path) as (fake_db, mock_agent_cls):
+            run_job(job)
+
+            kwargs = mock_agent_cls.call_args.kwargs
+            # Construct the real agent with exactly the kwargs cron produced
+            # and prove the native memory store is never loaded from disk.
+            with patch("tools.memory_tool.MemoryStore.load_from_disk") as mock_load:
+                RealAIAgent(**kwargs)
+            mock_load.assert_not_called()
+
     def test_tick_skips_due_jobs_while_dispatch_is_paused(self, tmp_path):
         """The drain gate runs before advancing a due job's schedule."""
         from cron.scheduler import tick

@@ -597,6 +597,47 @@ def _merge_mcp_into_per_job_toolsets(per_job: list[str], cfg: dict) -> list[str]
     return result
 
 
+def _cron_native_memory_enabled(cfg: dict) -> bool:
+    """Whether cron-spawned agents may use native memory (MEMORY.md / USER.md).
+
+    ``cron.native_memory_enabled`` in config.yaml, default ``true``
+    (upstream-compatible: an absent flag preserves current behavior exactly).
+
+    Deployments that run a separate, authoritative memory layer (e.g. a
+    distiller owning all memory writes) set it ``false`` to enforce the
+    no-double-writer rule: no agent cron job forks native memory, including
+    jobs that explicitly name the memory toolset. ``false`` means the
+    scheduler both constructs agents with ``skip_memory=True`` (see the
+    AIAgent construction site in run_job) AND strips ``memory`` from the
+    effective enabled toolsets (see ``_resolve_cron_enabled_toolsets``),
+    closing the ``_memory_toolset_requested`` re-widening path in agent
+    init where a per-job ``enabled_toolsets`` naming ``memory`` would
+    otherwise reload the store even under ``skip_memory=True``.
+    """
+    cron_cfg = (cfg or {}).get("cron") or {}
+    return bool(cron_cfg.get("native_memory_enabled", True))
+
+
+def _strip_memory_toolset_when_native_memory_disabled(
+    toolsets: list[str], cfg: dict
+) -> list[str]:
+    """Deny ``memory`` in a resolved enabled-toolset list when opted out.
+
+    No-op when ``cron.native_memory_enabled`` is absent/true (default) or
+    when the list does not name ``memory``.
+    """
+    if not toolsets or "memory" not in toolsets:
+        return toolsets
+    if _cron_native_memory_enabled(cfg):
+        return toolsets
+    stripped = [t for t in toolsets if t != "memory"]
+    logger.info(
+        "cron.native_memory_enabled=false: stripped 'memory' from the "
+        "effective enabled toolsets (no-double-writer rule)"
+    )
+    return stripped
+
+
 def _resolve_cron_enabled_toolsets(job: dict, cfg: dict) -> list[str] | None:
     """Resolve the toolset list for a cron job.
 
@@ -618,10 +659,14 @@ def _resolve_cron_enabled_toolsets(job: dict, cfg: dict) -> list[str] | None:
     """
     per_job = job.get("enabled_toolsets")
     if per_job:
-        return _merge_mcp_into_per_job_toolsets(list(per_job), cfg or {})
+        return _strip_memory_toolset_when_native_memory_disabled(
+            _merge_mcp_into_per_job_toolsets(list(per_job), cfg or {}), cfg
+        )
     try:
         from hermes_cli.tools_config import _get_platform_tools  # lazy: avoid heavy import at cron module load
-        return sorted(_get_platform_tools(cfg or {}, "cron"))
+        return _strip_memory_toolset_when_native_memory_disabled(
+            sorted(_get_platform_tools(cfg or {}, "cron")), cfg
+        )
     except Exception as exc:
         logger.warning(
             "Cron toolset resolution failed, falling back to full default toolset: %s",
@@ -6453,11 +6498,17 @@ def run_job(
             # Without a workdir, keep cwd context discovery disabled.
             skip_context_files=not bool(_job_workdir),
             load_soul_identity=True,
-            # Memory is enabled for cron agents like any other agent run:
-            # MEMORY.md / USER.md load into the system prompt and the memory
-            # tool follows normal toolset resolution, so jobs benefit from
-            # (and can update) the user's persistent memory.
-            skip_memory=False,
+            # Memory is enabled for cron agents like any other agent run by
+            # default: MEMORY.md / USER.md load into the system prompt and
+            # the memory tool follows normal toolset resolution, so jobs
+            # benefit from (and can update) the user's persistent memory.
+            # Deployments with a separate authoritative memory layer set
+            # cron.native_memory_enabled: false (no-double-writer rule):
+            # agents are then constructed with skip_memory=True AND "memory"
+            # is stripped from the effective enabled toolsets in
+            # _resolve_cron_enabled_toolsets, closing the
+            # _memory_toolset_requested re-widening path in agent init.
+            skip_memory=not _cron_native_memory_enabled(_cfg),
             skip_background_review=True,  # Cron has no human-in-the-loop need for skill/memory review forks (~30K tok/event)
             platform="cron",
             session_id=_cron_session_id,
