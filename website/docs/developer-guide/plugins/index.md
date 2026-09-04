@@ -940,10 +940,11 @@ Each hook is documented in full on the **[Event Hooks reference](/user-guide/fea
 | `kanban_task_claimed` | A kanban task is claimed (dispatcher process, before the worker spawns) | `task_id: str, board: str \| None, assignee: str \| None, run_id: int \| None, profile_name: str` | ignored |
 | `kanban_task_completed` | A kanban task completes (worker process) | `task_id, board, assignee, run_id, profile_name, summary: str \| None` | ignored |
 | `kanban_task_blocked` | A kanban task is blocked (worker process) | `task_id, board, assignee, run_id, profile_name, reason: str \| None` | ignored |
+| [`pre_memory_load`](/user-guide/features/hooks#pre_memory_load) | Once per agent construction, after plugin discovery and before `MemoryStore.load_from_disk()` freezes the system-prompt memory snapshot | `hermes_home: str, memory_dir: str, platform: str, session_id: str, projection_source: str, required: bool` | **fail-closed** directive: `{"action": "block", "message": ...}`, a raised exception, or a timeout aborts agent initialization; `None` / `{"action": "allow"}` proceeds |
 
-Most hooks are fire-and-forget observers — their return values are ignored. The exceptions are `pre_llm_call`, which can inject context into the conversation, and `pre_tool_call`, which can return a block/approve directive.
+Most hooks are fire-and-forget observers — their return values are ignored. The exceptions are `pre_llm_call`, which can inject context into the conversation, and `pre_tool_call`, which can return a block/approve directive, and `pre_memory_load`, which can abort agent initialization before memory is read.
 
-All callbacks should accept `**kwargs` for forward compatibility. If a hook callback crashes, it's logged and skipped. Other hooks and the agent continue normally.
+All callbacks should accept `**kwargs` for forward compatibility. If a hook callback crashes, it's logged and skipped. Other hooks and the agent continue normally. The one exception is `pre_memory_load`: it is a fail-closed gate, so a crash there aborts initialization instead of being skipped.
 
 The kanban lifecycle hooks fire **after** the board DB change commits, so a callback always sees durable state and can never hold the SQLite write lock. Because kanban workers run as separate `hermes -p <profile> chat -q` subprocesses, `kanban_task_claimed` fires in the **dispatcher** process while `kanban_task_completed` / `kanban_task_blocked` fire in the **worker** process — hook in the dispatcher to observe every transition centrally, or in the worker for per-task in-session context.
 
@@ -1615,7 +1616,7 @@ hooks:
       tools: [terminal, patch, write_file]
 ```
 
-Supports all the same events as Python plugin hooks (`pre_tool_call`, `post_tool_call`, `pre_llm_call`, `post_llm_call`, `on_session_start`, `on_session_end`, `pre_gateway_dispatch`) plus structured JSON output for `pre_tool_call` blocking decisions.
+Supports all the same events as Python plugin hooks (`pre_tool_call`, `post_tool_call`, `pre_llm_call`, `post_llm_call`, `on_session_start`, `on_session_end`, `pre_gateway_dispatch`) plus structured JSON output for `pre_tool_call` blocking decisions. Python-plugin-only events (`transform_api_error_classification`, `pre_memory_load`) are refused with a warning, because shell stdout has no channel for their return value.
 
 **Full guide:** [Shell Hooks](/user-guide/features/hooks#shell-hooks).
 
