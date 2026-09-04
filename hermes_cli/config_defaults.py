@@ -2068,6 +2068,16 @@ DEFAULT_CONFIG = {
         #                     /memory reject <id>.
         # To disable memory entirely, use memory_enabled: false instead.
         "write_approval": False,
+        # Is the fail-closed ``pre_memory_load`` plugin gate a hard dependency
+        # for this profile? Only matters when a plugin owns a DERIVED
+        # MEMORY.md. False (default) = upstream behavior: with no hook
+        # registered memory loads unchanged, and a genuine MemoryStore load
+        # fault is swallowed (agent runs with empty memory). True = a
+        # pre_memory_load callback must return an explicit allow, and a store
+        # load fault raises instead of running empty — running memory-managed
+        # with zero memory is silent state loss. Gate refusals (block, raise,
+        # timeout) abort initialization either way.
+        "pre_memory_load_required": False,
         "memory_char_limit": 2200,   # ~800 tokens at 2.75 chars/token
         "user_char_limit": 1375,     # ~500 tokens at 2.75 chars/token
         # Periodic built-in memory review. External providers with automatic
