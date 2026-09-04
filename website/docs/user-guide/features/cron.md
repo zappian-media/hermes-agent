@@ -293,6 +293,27 @@ cadence, or run a "cron librarian" job that reconciles the whole table
 Prefer prompts that update existing jobs (list first, then update by ID)
 over ones that create new jobs each run.
 
+## Opting cron agents out of native memory
+
+By default, agents launched by the scheduler use native memory like any other
+agent run: `MEMORY.md` / `USER.md` load into the system prompt and the
+`memory` tool follows normal toolset resolution, so jobs can read and update
+your persistent memory. Deployments that run a separate, authoritative memory
+layer (for example, a distiller that owns all memory writes) can enforce a
+no-double-writer rule via `config.yaml`:
+
+```yaml
+cron:
+  native_memory_enabled: false   # default: true
+```
+
+When set to `false`, the scheduler constructs every cron agent with
+`skip_memory=True` **and** strips `memory` from the effective enabled
+toolsets — even for jobs whose per-job `enabled_toolsets` explicitly names
+`memory`. Both halves are required: on its own, `skip_memory=True` is
+re-widened by a job that names the memory toolset. Script-only (`no_agent`)
+jobs are unaffected.
+
 ## How it works
 
 **Cron execution is handled by the gateway daemon.** The gateway ticks the scheduler every 60 seconds, running any due jobs in isolated agent sessions.
