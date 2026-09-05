@@ -386,14 +386,16 @@ VALID_HOOKS: Set[str] = {
     #   alias_used: the exact token the user typed (str), args_raw: str,
     #   session_key: str | None (gateway), platform: str | None (gateway).
     "pre_command",
-    # Memory lifecycle gate (SPEC-2026-002 Task 6). Fired once per agent
+    # Memory lifecycle gate (SPEC-2026-002 Task 6). Fired at agent
     # construction — CLI, gateway, cron, subagents — after plugin discovery
     # and immediately BEFORE ``MemoryStore.load_from_disk()`` freezes the
-    # system-prompt memory snapshot, and OUTSIDE the memory block's
-    # ``except Exception: pass  # Memory is optional`` guard so a gate outcome
-    # can never be swallowed. This is the seam for a plugin that owns the
-    # projected MEMORY.md: rewrite the projection here and the snapshot picks
-    # up the new bytes.
+    # system-prompt memory snapshot, and again before EVERY later
+    # system-prompt memory freeze (context-compaction rebuilds that re-freeze
+    # MEMORY.md via ``agent.system_prompt.invalidate_system_prompt()``), and
+    # OUTSIDE the memory block's ``except Exception: pass  # Memory is
+    # optional`` guard so a gate outcome can never be swallowed. This is the
+    # seam for a plugin that owns the projected MEMORY.md: rewrite the
+    # projection here and the snapshot picks up the new bytes.
     #
     # FAIL-CLOSED, like ``pre_tool_call``: a ``block`` directive, a raising
     # callback, or a callback that times out / is still running ABORTS agent
