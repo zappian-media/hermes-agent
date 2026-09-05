@@ -1066,7 +1066,8 @@ def invalidate_system_prompt(agent: Any) -> None:
     """Invalidate the cached system prompt, forcing a rebuild on the next turn.
 
     Called after context compression events. Runs the same fail-closed
-    ``pre_memory_load`` gate used at construction before reloading memory from
+    ``pre_memory_load`` gate — used at agent construction AND re-run here,
+    before every system-prompt memory freeze — before reloading memory from
     disk, so every set of bytes frozen into a rebuilt prompt is vetted. Then
     clears
     the frozen plugin-section snapshot so plugins re-render at the same

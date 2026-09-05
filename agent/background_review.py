@@ -1099,6 +1099,34 @@ def _log_review_completion(usage: Dict[str, Any], result: str) -> None:
     )
 
 
+def _apply_review_fork_memory_parity(review_agent: Any, agent: Any) -> None:
+    """Graft the parent's live memory state onto a review fork.
+
+    The background-review / cache-parity fork shares the parent's built-in
+    MEMORY.md / USER.md store so ``memory(action=...)`` writes from the review
+    still land on disk. The fork also inherits the parent's fail-closed
+    ``pre_memory_load`` gate payload so that when a long review compacts and
+    ``invalidate_system_prompt()`` re-freezes memory, it re-runs the SAME gate
+    the parent ran at construction. Without the payload graft, the fork's
+    ``getattr(agent, "_pre_memory_load_gate_payload", None)`` is None and the
+    gate silently steps aside — unvetted memory bytes get frozen into the
+    shared store and the fork's prompt (red-team finding on hermes PR #3,
+    tracks zappian-media/zappian-agents#41).
+
+    A parent that never set a payload (no gate configured) grafts ``None`` and
+    the fork behaves exactly like the parent — no behavior change on
+    non-gated profiles.
+    """
+    review_agent._memory_store = agent._memory_store
+    review_agent._memory_enabled = agent._memory_enabled
+    review_agent._user_profile_enabled = agent._user_profile_enabled
+    review_agent._memory_nudge_interval = 0
+    review_agent._skill_nudge_interval = 0
+    review_agent._pre_memory_load_gate_payload = getattr(
+        agent, "_pre_memory_load_gate_payload", None
+    )
+
+
 def build_cache_parity_fork(
     agent: Any,
     task_cfg: Optional[Dict[str, Any]] = None,
@@ -1243,11 +1271,7 @@ def build_cache_parity_fork(
     # add late-connecting MCP tools to this fork and break that parity,
     # so opt the review fork out of it.
     review_agent._skip_mcp_refresh = True
-    review_agent._memory_store = agent._memory_store
-    review_agent._memory_enabled = agent._memory_enabled
-    review_agent._user_profile_enabled = agent._user_profile_enabled
-    review_agent._memory_nudge_interval = 0
-    review_agent._skill_nudge_interval = 0
+    _apply_review_fork_memory_parity(review_agent, agent)
     # PERSISTENCE ISOLATION (the curator-takeover root cause): the fork
     # shares the parent's session_id (set below, for prompt-cache
     # warmth), so without this it would write its harness turn ("Review
