@@ -5637,7 +5637,10 @@ class PluginManager:
         open (skip). Hooks in ``_HOOK_ERROR_FAIL_CLOSED_HOOKS``
         (``pre_memory_load``) also turn a RAISED callback into a block
         directive instead of only logging it — for a gate, isolation must not
-        become a swallow.
+        become a swallow. The worker catches ``BaseException`` as well, so a
+        callback smuggling ``SystemExit`` / ``KeyboardInterrupt`` cannot fail
+        the gate open by dying silently on the worker thread; other hooks
+        keep their fail-open outcome but get the same warning log.
 
         ``subagent_stop`` (and any hook in ``_HOOK_CALLER_THREAD_HOOKS``)
         always runs on the caller thread to preserve the documented parent-
@@ -5701,7 +5704,7 @@ class PluginManager:
                     context = contextvars.copy_context()
                     done = threading.Event()
                     outcome: Dict[str, Any] = {}
-                    failure: Dict[str, Exception] = {}
+                    failure: Dict[str, BaseException] = {}
 
                     def _runner(
                         _cb: Callable[..., Any] = cb,
@@ -5715,7 +5718,12 @@ class PluginManager:
                             outcome["value"] = context.run(
                                 self._invoke_hook_callback, _cb, kwargs
                             )
-                        except Exception as exc:
+                        except BaseException as exc:
+                            # BaseException too: a smuggled SystemExit /
+                            # KeyboardInterrupt must not kill the worker
+                            # silently - for a policy hook that would fail
+                            # the gate OPEN. The caller thread applies the
+                            # hook's error policy below.
                             failure["exc"] = exc
                         finally:
                             with self._hook_timeout_lock:
@@ -5746,7 +5754,23 @@ class PluginManager:
                             results.append(_policy_hook_timeout_block(hook_name))
                         continue
                     if "exc" in failure:
-                        raise failure["exc"]
+                        exc = failure["exc"]
+                        if isinstance(exc, Exception):
+                            raise exc
+                        # Smuggled BaseException (SystemExit /
+                        # KeyboardInterrupt / custom): do not re-raise raw on
+                        # the caller thread - that would masquerade as a real
+                        # interpreter exit or Ctrl-C. Log it like any raised
+                        # callback and apply the hook's error policy.
+                        logger.warning(
+                            "Hook '%s' callback %s raised: %s",
+                            hook_name,
+                            callback_name,
+                            exc,
+                        )
+                        if error_fail_closed:
+                            results.append(_policy_hook_error_block(hook_name, exc))
+                        continue
                     ret = outcome.get("value")
                 else:
                     ret = self._invoke_hook_callback(cb, kwargs)
