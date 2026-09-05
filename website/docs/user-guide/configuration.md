@@ -729,7 +729,10 @@ memory:
   memory_char_limit: 2200   # ~800 tokens
   user_char_limit: 1375     # ~500 tokens
   write_approval: false     # true = require approval before any memory write
+  pre_memory_load_required: false  # true = the pre_memory_load gate is a hard dependency
 ```
+
+`memory.pre_memory_load_required` only matters when a plugin owns a *derived* `MEMORY.md`. Left `false` (the default), the [`pre_memory_load`](/user-guide/features/hooks#pre_memory_load) gate is advisory — with no hook registered, memory loads exactly as it always has, and a genuine load fault (unreadable `MEMORY.md`) is swallowed and the agent runs with empty memory. Set `true` and both halves become fail-loud for that profile: a `pre_memory_load` callback must return an explicit allow (so a missing projection plugin aborts initialization rather than silently using stale on-disk bytes), and a `MemoryStore` load fault raises instead of running empty. Gate refusals — block, raise, or timeout — always abort initialization regardless of this flag.
 
 With `memory.write_approval: true`, memory writes need your approval before they land: interactive CLI turns prompt inline; messaging sessions and the background self-improvement review stage the write for `/memory pending` → `/memory approve <id>` / `/memory reject <id>` review. Toggle at runtime with `/memory approval on|off`. See [Controlling memory writes](/user-guide/features/memory#controlling-memory-writes-write_approval).
 

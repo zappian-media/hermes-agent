@@ -238,7 +238,13 @@ memory:
   memory_char_limit: 2200   # ~800 tokens
   user_char_limit: 1375     # ~500 tokens
   write_approval: false     # false = write freely (default) | true = require approval
+  pre_memory_load_required: false  # true = a pre_memory_load plugin gate must allow the load
 ```
+
+`pre_memory_load_required` is for profiles where a plugin generates `MEMORY.md`
+rather than the agent writing it directly — see the
+[`pre_memory_load` hook](/user-guide/features/hooks#pre_memory_load). Default
+`false` keeps upstream behavior: no registered hook means memory loads exactly as before.
 
 Setting **both** `memory_enabled` and `user_profile_enabled` to `false` turns the
 built-in stores off completely: the `memory` tool is dropped from the schema and

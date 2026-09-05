@@ -386,6 +386,30 @@ VALID_HOOKS: Set[str] = {
     #   alias_used: the exact token the user typed (str), args_raw: str,
     #   session_key: str | None (gateway), platform: str | None (gateway).
     "pre_command",
+    # Memory lifecycle gate (SPEC-2026-002 Task 6). Fired once per agent
+    # construction — CLI, gateway, cron, subagents — after plugin discovery
+    # and immediately BEFORE ``MemoryStore.load_from_disk()`` freezes the
+    # system-prompt memory snapshot, and OUTSIDE the memory block's
+    # ``except Exception: pass  # Memory is optional`` guard so a gate outcome
+    # can never be swallowed. This is the seam for a plugin that owns the
+    # projected MEMORY.md: rewrite the projection here and the snapshot picks
+    # up the new bytes.
+    #
+    # FAIL-CLOSED, like ``pre_tool_call``: a ``block`` directive, a raising
+    # callback, or a callback that times out / is still running ABORTS agent
+    # initialization with ``PreMemoryLoadBlocked`` rather than continuing with
+    # stale memory. Return ``None`` (or anything that is not a block
+    # directive) to allow. Block shapes::
+    #   {"action": "block", "message": "..."}
+    #   {"decision": "block", "reason": "..."}   # Claude-Code shape
+    # When the profile sets ``memory.pre_memory_load_required: true``, silence
+    # is no longer allow: some callback must return ``{"action": "allow"}``, and
+    # a genuine ``MemoryStore`` load fault also fails initialization loudly.
+    #
+    # Kwargs: hermes_home, memory_dir, platform, session_id, projection_source,
+    #   memory_char_limit, user_char_limit, required, skip_memory,
+    #   memory_toolset_requested. Paths and identifiers only — never secrets.
+    "pre_memory_load",
 }
 
 # Hooks whose return value carries a directive that the shell-hook response
@@ -396,6 +420,11 @@ VALID_HOOKS: Set[str] = {
 # Support for a shell response shape can lift an event out of this set.
 SHELL_UNSUPPORTED_HOOKS: Set[str] = {
     "transform_api_error_classification",
+    # A shell hook cannot abort agent construction: _parse_response has no
+    # channel for the gate's block directive, so the refusal would be dropped
+    # and memory would load anyway — the exact failure this gate exists to
+    # prevent. Python plugins only.
+    "pre_memory_load",
 }
 
 # Timeout coverage is an allowlist for the agent-turn hot path, not every
@@ -438,9 +467,18 @@ _HOOK_TIMEOUT_BOUNDED_HOOKS: Set[str] = {
     "on_session_end",
 }
 
-# Policy hooks: timeout / still-running must fail closed (block the tool).
-# Skipping would let the tool run without a completed policy decision.
-_HOOK_TIMEOUT_FAIL_CLOSED_HOOKS: Set[str] = {"pre_tool_call"}
+# Policy hooks: timeout / still-running must fail closed (block the tool /
+# abort the memory load). Skipping would let the action proceed without a
+# completed policy decision.
+_HOOK_TIMEOUT_FAIL_CLOSED_HOOKS: Set[str] = {"pre_tool_call", "pre_memory_load"}
+
+# Policy hooks whose callback EXCEPTION must also fail closed. ``invoke_hook``
+# isolates every callback, so a raising callback normally just logs a warning
+# and contributes nothing — fail-open. For the memory gate that is exactly the
+# swallow SPEC-2026-002 Delta 1 forbids, so a raise is converted into a block
+# directive carrying the exception text. ``pre_tool_call`` keeps its historical
+# fail-open-on-raise behavior.
+_HOOK_ERROR_FAIL_CLOSED_HOOKS: Set[str] = {"pre_memory_load"}
 
 # Documented parent-thread serialization contract — never move the callback
 # body onto a timeout worker (see website/docs/user-guide/features/hooks.md).
@@ -453,6 +491,16 @@ _HOOK_TIMEOUT_SUPPRESSION_SECONDS = 60.0
 _PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE = (
     "pre_tool_call plugin callback timed out or is still running"
 )
+
+_PRE_MEMORY_LOAD_TIMEOUT_BLOCK_MESSAGE = (
+    "pre_memory_load plugin callback timed out or is still running"
+)
+
+# Per-hook fail-closed timeout messages; hooks absent here use the
+# pre_tool_call wording (its exact bytes are pinned by existing tests).
+_POLICY_HOOK_TIMEOUT_BLOCK_MESSAGES: Dict[str, str] = {
+    "pre_memory_load": _PRE_MEMORY_LOAD_TIMEOUT_BLOCK_MESSAGE,
+}
 
 ENTRY_POINTS_GROUP = "hermes_agent.plugins"
 ENTRY_POINT_CAPABILITIES_GROUP = "hermes_agent.plugin_capabilities"
@@ -3723,11 +3771,21 @@ def _hook_uses_callback_timeout(hook_name: str, timeout: float) -> bool:
     )
 
 
-def _pre_tool_call_timeout_block() -> Dict[str, str]:
+def _policy_hook_timeout_block(hook_name: str = "pre_tool_call") -> Dict[str, str]:
     """Fail-closed directive when a policy callback times out or is still running."""
     return {
         "action": "block",
-        "message": _PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE,
+        "message": _POLICY_HOOK_TIMEOUT_BLOCK_MESSAGES.get(
+            hook_name, _PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE
+        ),
+    }
+
+
+def _policy_hook_error_block(hook_name: str, exc: BaseException) -> Dict[str, str]:
+    """Fail-closed directive for a policy callback that raised."""
+    return {
+        "action": "block",
+        "message": f"{hook_name} plugin callback raised: {exc}",
     }
 
 
@@ -5571,11 +5629,18 @@ class PluginManager:
         core agent loop.
 
         Hot-path / observer hooks in ``_HOOK_TIMEOUT_BOUNDED_HOOKS`` and the
-        policy hook ``pre_tool_call`` are bounded by
-        ``plugins.hook_callback_timeout`` (default 30s). On timeout the worker
-        is abandoned (not joined) so we do not reintroduce the #6622 hang.
-        Timed-out or still-running ``pre_tool_call`` callbacks fail closed
-        with a block directive; other bounded hooks fail open (skip).
+        policy hooks in ``_HOOK_TIMEOUT_FAIL_CLOSED_HOOKS`` (``pre_tool_call``,
+        ``pre_memory_load``) are bounded by ``plugins.hook_callback_timeout``
+        (default 30s). On timeout the worker is abandoned (not joined) so we do
+        not reintroduce the #6622 hang. Timed-out or still-running policy-hook
+        callbacks fail closed with a block directive; other bounded hooks fail
+        open (skip). Hooks in ``_HOOK_ERROR_FAIL_CLOSED_HOOKS``
+        (``pre_memory_load``) also turn a RAISED callback into a block
+        directive instead of only logging it — for a gate, isolation must not
+        become a swallow. The worker catches ``BaseException`` as well, so a
+        callback smuggling ``SystemExit`` / ``KeyboardInterrupt`` cannot fail
+        the gate open by dying silently on the worker thread; other hooks
+        keep their fail-open outcome but get the same warning log.
 
         ``subagent_stop`` (and any hook in ``_HOOK_CALLER_THREAD_HOOKS``)
         always runs on the caller thread to preserve the documented parent-
@@ -5606,6 +5671,7 @@ class PluginManager:
         timeout = _resolve_hook_callback_timeout()
         use_timeout = _hook_uses_callback_timeout(hook_name, timeout)
         fail_closed = hook_name in _HOOK_TIMEOUT_FAIL_CLOSED_HOOKS
+        error_fail_closed = hook_name in _HOOK_ERROR_FAIL_CLOSED_HOOKS
 
         for cb in callbacks:
             callback_name = getattr(cb, "__name__", repr(cb))
@@ -5629,7 +5695,7 @@ class PluginManager:
                                 callback_name,
                             )
                             if fail_closed:
-                                results.append(_pre_tool_call_timeout_block())
+                                results.append(_policy_hook_timeout_block(hook_name))
                             continue
                         if suppressed_until is not None:
                             self._hook_timeout_suppressed_until.pop(callback_key, None)
@@ -5638,7 +5704,7 @@ class PluginManager:
                     context = contextvars.copy_context()
                     done = threading.Event()
                     outcome: Dict[str, Any] = {}
-                    failure: Dict[str, Exception] = {}
+                    failure: Dict[str, BaseException] = {}
 
                     def _runner(
                         _cb: Callable[..., Any] = cb,
@@ -5652,7 +5718,12 @@ class PluginManager:
                             outcome["value"] = context.run(
                                 self._invoke_hook_callback, _cb, kwargs
                             )
-                        except Exception as exc:
+                        except BaseException as exc:
+                            # BaseException too: a smuggled SystemExit /
+                            # KeyboardInterrupt must not kill the worker
+                            # silently - for a policy hook that would fail
+                            # the gate OPEN. The caller thread applies the
+                            # hook's error policy below.
                             failure["exc"] = exc
                         finally:
                             with self._hook_timeout_lock:
@@ -5680,10 +5751,26 @@ class PluginManager:
                             timeout,
                         )
                         if fail_closed:
-                            results.append(_pre_tool_call_timeout_block())
+                            results.append(_policy_hook_timeout_block(hook_name))
                         continue
                     if "exc" in failure:
-                        raise failure["exc"]
+                        exc = failure["exc"]
+                        if isinstance(exc, Exception):
+                            raise exc
+                        # Smuggled BaseException (SystemExit /
+                        # KeyboardInterrupt / custom): do not re-raise raw on
+                        # the caller thread - that would masquerade as a real
+                        # interpreter exit or Ctrl-C. Log it like any raised
+                        # callback and apply the hook's error policy.
+                        logger.warning(
+                            "Hook '%s' callback %s raised: %s",
+                            hook_name,
+                            callback_name,
+                            exc,
+                        )
+                        if error_fail_closed:
+                            results.append(_policy_hook_error_block(hook_name, exc))
+                        continue
                     ret = outcome.get("value")
                 else:
                     ret = self._invoke_hook_callback(cb, kwargs)
@@ -5696,6 +5783,10 @@ class PluginManager:
                     callback_name,
                     exc,
                 )
+                if error_fail_closed:
+                    # Isolation must not become a swallow for these hooks: the
+                    # caller needs the failure as a block directive.
+                    results.append(_policy_hook_error_block(hook_name, exc))
         return results
 
     def _subscribe_event(
@@ -6866,6 +6957,92 @@ def _dispatch_pre_tool_call_hooks(
         turn_id=turn_id, tool_call_id=tool_call_id, session_id=session_id,
     )
     return (block_msg, details.modified_args)
+
+
+class PreMemoryLoadBlocked(RuntimeError):
+    """The fail-closed ``pre_memory_load`` gate refused the memory load.
+
+    Raised out of agent initialization (never caught by the memory block's
+    ``except Exception: pass``) so no surface can start a turn with stale or
+    unvetted MEMORY.md bytes frozen into its system prompt.
+    """
+
+
+_PRE_MEMORY_LOAD_DEFAULT_BLOCK_MESSAGE = "plugin blocked the memory load"
+
+_PRE_MEMORY_LOAD_MISSING_ALLOW_MESSAGE = (
+    "memory.pre_memory_load_required is set for this profile but no "
+    "pre_memory_load plugin hook returned an explicit allow"
+)
+
+
+def _pre_memory_load_block_message(result: Any) -> Optional[str]:
+    """Return the block message carried by *result*, or ``None`` to allow."""
+    if not isinstance(result, dict):
+        return None
+    action = str(result.get("action") or "").strip().lower()
+    decision = str(result.get("decision") or "").strip().lower()
+    if action in ("block", "deny") or decision == "block":
+        return str(
+            result.get("message")
+            or result.get("reason")
+            or _PRE_MEMORY_LOAD_DEFAULT_BLOCK_MESSAGE
+        )
+    return None
+
+
+def _is_pre_memory_load_allow(result: Any) -> bool:
+    """Whether *result* is an EXPLICIT allow (only relevant when required)."""
+    if not isinstance(result, dict):
+        return False
+    if str(result.get("action") or "").strip().lower() in ("allow", "proceed"):
+        return True
+    return result.get("allow") is True
+
+
+def get_pre_memory_load_block_message(**payload: Any) -> Optional[str]:
+    """Resolve the ``pre_memory_load`` gate to a block message (or ``None``).
+
+    Fail-closed on every failure mode: a ``block``/``deny`` directive, a
+    callback that raised (``_HOOK_ERROR_FAIL_CLOSED_HOOKS``), and a callback
+    that timed out or is still running (``_HOOK_TIMEOUT_FAIL_CLOSED_HOOKS``)
+    all resolve to a block. First block in registration order wins.
+
+    With no hook registered and ``required`` false, this is a single dict probe
+    and behavior is unchanged. When ``payload["required"]`` is true the gate is
+    a hard dependency: silence — no hook, or a hook that returns nothing — is
+    not allow, because running memory-managed with unvetted memory is silent
+    state loss.
+    """
+    required = bool(payload.get("required"))
+    if not required and not has_hook("pre_memory_load"):
+        return None
+
+    allowed = False
+    for result in invoke_hook("pre_memory_load", **payload):
+        message = _pre_memory_load_block_message(result)
+        if message is not None:
+            return message
+        if _is_pre_memory_load_allow(result):
+            allowed = True
+
+    if required and not allowed:
+        return _PRE_MEMORY_LOAD_MISSING_ALLOW_MESSAGE
+    return None
+
+
+def enforce_pre_memory_load_gate(**payload: Any) -> None:
+    """Run the gate and raise :class:`PreMemoryLoadBlocked` when it refuses.
+
+    Call sites MUST sit outside any exception guard that swallows memory
+    faults (SPEC-2026-002 Delta 1) — see ``agent/agent_init.py``.
+    """
+    message = get_pre_memory_load_block_message(**payload)
+    if message is None:
+        return
+    raise PreMemoryLoadBlocked(
+        f"pre_memory_load gate aborted agent initialization: {message}"
+    )
 
 
 def get_pre_verify_continue_message(
