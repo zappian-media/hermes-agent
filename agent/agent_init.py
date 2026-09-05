@@ -1919,20 +1919,24 @@ def init_agent(
             from hermes_constants import get_hermes_home as _get_hermes_home
             from tools.memory_tool import get_memory_dir as _get_memory_dir
 
-            _enforce_pre_memory_load_gate(
-                hermes_home=str(_get_hermes_home()),
-                memory_dir=str(_get_memory_dir()),
-                platform=getattr(agent, "platform", "") or "",
-                session_id=getattr(agent, "session_id", "") or "",
-                projection_source=str(
+            # Keep the exact non-secret construction payload on the agent so
+            # every later load_from_disk() at the allowed compaction rebuild
+            # boundary can run the same gate before re-freezing MEMORY.md.
+            agent._pre_memory_load_gate_payload = {
+                "hermes_home": str(_get_hermes_home()),
+                "memory_dir": str(_get_memory_dir()),
+                "platform": getattr(agent, "platform", "") or "",
+                "session_id": getattr(agent, "session_id", "") or "",
+                "projection_source": str(
                     _memory_cfg_section.get("projection_source") or ""
                 ),
-                memory_char_limit=_memory_cfg_section.get("memory_char_limit", 2200),
-                user_char_limit=_memory_cfg_section.get("user_char_limit", 1375),
-                required=_pre_memory_load_required,
-                skip_memory=bool(skip_memory),
-                memory_toolset_requested=bool(_memory_toolset_requested),
-            )
+                "memory_char_limit": _memory_cfg_section.get("memory_char_limit", 2200),
+                "user_char_limit": _memory_cfg_section.get("user_char_limit", 1375),
+                "required": _pre_memory_load_required,
+                "skip_memory": bool(skip_memory),
+                "memory_toolset_requested": bool(_memory_toolset_requested),
+            }
+            _enforce_pre_memory_load_gate(**agent._pre_memory_load_gate_payload)
 
         try:
             from tools.memory_tool import (
