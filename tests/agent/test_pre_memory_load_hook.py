@@ -603,3 +603,66 @@ def test_truthy_strings_enable_required_mode(monkeypatch, hermes_home, on):
     with pytest.raises(plugins_mod.PreMemoryLoadBlocked) as exc:
         _make_agent(monkeypatch)
     assert "required" in str(exc.value)
+
+
+# ---------------------------------------------------------------------------
+# 8. Issue #41 — every later MEMORY.md freeze is gated too
+# ---------------------------------------------------------------------------
+
+def test_compaction_reload_gate_blocks_before_memory_is_refrozen(
+    monkeypatch, hermes_home, register_gate
+):
+    """A gate that turns unhealthy after startup must veto compaction reload."""
+    gate_calls = []
+
+    def _gate(**kwargs):
+        gate_calls.append(kwargs)
+        if len(gate_calls) == 1:
+            return {"action": "allow"}
+        return {"action": "block", "message": "projection became stale"}
+
+    register_gate(_gate)
+    agent = _make_agent(monkeypatch)
+    memory_store = getattr(agent, "_memory_store")
+
+    loads = []
+    monkeypatch.setattr(
+        memory_store,
+        "load_from_disk",
+        lambda: loads.append("unguarded reload"),
+    )
+
+    with pytest.raises(plugins_mod.PreMemoryLoadBlocked) as exc:
+        agent._invalidate_system_prompt()
+
+    assert "projection became stale" in str(exc.value)
+    assert len(gate_calls) == 2
+    assert loads == []
+
+
+def test_compaction_reload_refreezes_bytes_written_by_the_gate(
+    monkeypatch, hermes_home, register_gate
+):
+    """The reload seam stays before load_from_disk, just like construction."""
+    gate_calls = 0
+
+    def _project(**kwargs):
+        nonlocal gate_calls
+        gate_calls += 1
+        if gate_calls == 2:
+            Path(kwargs["memory_dir"], "MEMORY.md").write_text(
+                "task06-reprojected-at-compaction\n", encoding="utf-8"
+            )
+        return {"action": "allow"}
+
+    register_gate(_project)
+    agent = _make_agent(monkeypatch)
+    memory_store = getattr(agent, "_memory_store")
+    assert "task06-memory-line" in memory_store.format_for_system_prompt("memory")
+
+    agent._invalidate_system_prompt()
+
+    block = memory_store.format_for_system_prompt("memory")
+    assert gate_calls == 2
+    assert "task06-reprojected-at-compaction" in block
+    assert "task06-memory-line" not in block
