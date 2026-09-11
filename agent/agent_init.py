@@ -1948,8 +1948,13 @@ def init_agent(
             _memory_cfg_section = _get_builtin_memory_config(_agent_cfg) or {}
         except Exception:
             logger.debug("Could not resolve memory config section", exc_info=True)
-        _pre_memory_load_required = bool(
-            _memory_cfg_section.get("pre_memory_load_required", False)
+        # is_truthy_value, not raw bool(): a quoted YAML string ("false",
+        # "no", "0", "off") must NOT enable required mode. Raw bool() treats
+        # any non-empty string as true, so a profile written with quotes would
+        # silently become memory-managed and abort startup when no plugin
+        # returns an explicit allow.
+        _pre_memory_load_required = is_truthy_value(
+            _memory_cfg_section.get("pre_memory_load_required"), default=False
         )
 
         from hermes_cli.plugins import (

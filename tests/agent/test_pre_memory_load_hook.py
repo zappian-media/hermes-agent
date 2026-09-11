@@ -503,3 +503,166 @@ def test_required_gate_allows_when_hook_allows(monkeypatch, hermes_home, registe
     agent = _make_agent(monkeypatch)
     assert agent._memory_store is not None
     assert "task06-memory-line" in agent._memory_store.format_for_system_prompt("memory")
+
+
+# ---------------------------------------------------------------------------
+# 6. Red-team F1 - BaseException smuggling must fail closed
+# ---------------------------------------------------------------------------
+# invoke_hook's timeout worker used to catch only ``except Exception``. A gate
+# callback raising SystemExit / KeyboardInterrupt / any BaseException killed
+# the worker thread, ``finally`` still set ``done``, and the callback
+# contributed nothing - the gate ALLOWED and memory loaded. A plugin that
+# calls ``sys.exit()`` or validates its config with ``argparse`` is a
+# realistic trigger. The worker must catch BaseException and hand it to the
+# caller thread, where the hook's error policy applies.
+
+class _CustomBaseException(BaseException):
+    pass
+
+
+@pytest.mark.parametrize(
+    "smuggled",
+    [
+        SystemExit("projection stale"),
+        KeyboardInterrupt(),
+        _CustomBaseException("custom base"),
+    ],
+    ids=["system_exit", "keyboard_interrupt", "custom_base_exception"],
+)
+def test_base_exception_callback_yields_block_directive_from_invoke_hook(smuggled):
+    mgr = PluginManager()
+    mgr._discovered = True
+
+    def boom(**_kwargs):
+        raise smuggled
+
+    mgr._hooks[HOOK] = [boom]
+    results = mgr.invoke_hook(HOOK)
+    assert results and results[0].get("action") == "block"
+    assert HOOK in results[0].get("message", "")
+
+
+def test_system_exit_gate_aborts_init_loudly(monkeypatch, hermes_home, register_gate):
+    """End-to-end: a sys.exit()-style gate callback must veto the load."""
+
+    def boom(**_kwargs):
+        raise SystemExit("projection stale")
+
+    register_gate(boom)
+    with pytest.raises(plugins_mod.PreMemoryLoadBlocked) as exc:
+        _make_agent(monkeypatch)
+    assert HOOK in str(exc.value)
+
+
+def test_pre_tool_call_base_exception_is_logged_not_swallowed(caplog):
+    """pre_tool_call keeps its historical fail-open-on-raise policy, but a
+    BaseException must be logged like any raised callback - not die silently
+    on the worker thread."""
+    import logging
+
+    mgr = PluginManager()
+    mgr._discovered = True
+
+    def boom(**_kwargs):
+        raise SystemExit("tool gate exit")
+
+    mgr._hooks["pre_tool_call"] = [boom]
+    with caplog.at_level(logging.WARNING, logger="hermes_cli.plugins"):
+        results = mgr.invoke_hook("pre_tool_call", tool_name="x")
+    assert results == []  # historical fail-open outcome, unchanged
+    assert any("tool gate exit" in record.getMessage() for record in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# 7. Red-team F3 - `required` flag uses the shared truthy coercion
+# ---------------------------------------------------------------------------
+# agent_init parsed memory.pre_memory_load_required with raw bool(), so a
+# quoted YAML string like "false" / "no" / "0" ENABLED required mode. Use the
+# already-imported is_truthy_value instead.
+
+def test_quoted_false_string_does_not_enable_required_mode(
+    monkeypatch, hermes_home
+):
+    _write_memory_config(hermes_home, pre_memory_load_required="false")
+    agent = _make_agent(monkeypatch)  # must not raise PreMemoryLoadBlocked
+    assert agent._memory_store is not None
+
+
+@pytest.mark.parametrize("off", ["no", "0", "off", ""])
+def test_other_falsey_strings_do_not_enable_required_mode(
+    monkeypatch, hermes_home, off
+):
+    _write_memory_config(hermes_home, pre_memory_load_required=off)
+    agent = _make_agent(monkeypatch)
+    assert agent._memory_store is not None
+
+
+@pytest.mark.parametrize("on", ["true", "yes", "1"])
+def test_truthy_strings_enable_required_mode(monkeypatch, hermes_home, on):
+    _write_memory_config(hermes_home, pre_memory_load_required=on)
+    with pytest.raises(plugins_mod.PreMemoryLoadBlocked) as exc:
+        _make_agent(monkeypatch)
+    assert "required" in str(exc.value)
+
+
+# ---------------------------------------------------------------------------
+# 8. Issue #41 — every later MEMORY.md freeze is gated too
+# ---------------------------------------------------------------------------
+
+def test_compaction_reload_gate_blocks_before_memory_is_refrozen(
+    monkeypatch, hermes_home, register_gate
+):
+    """A gate that turns unhealthy after startup must veto compaction reload."""
+    gate_calls = []
+
+    def _gate(**kwargs):
+        gate_calls.append(kwargs)
+        if len(gate_calls) == 1:
+            return {"action": "allow"}
+        return {"action": "block", "message": "projection became stale"}
+
+    register_gate(_gate)
+    agent = _make_agent(monkeypatch)
+    memory_store = getattr(agent, "_memory_store")
+
+    loads = []
+    monkeypatch.setattr(
+        memory_store,
+        "load_from_disk",
+        lambda: loads.append("unguarded reload"),
+    )
+
+    with pytest.raises(plugins_mod.PreMemoryLoadBlocked) as exc:
+        agent._invalidate_system_prompt()
+
+    assert "projection became stale" in str(exc.value)
+    assert len(gate_calls) == 2
+    assert loads == []
+
+
+def test_compaction_reload_refreezes_bytes_written_by_the_gate(
+    monkeypatch, hermes_home, register_gate
+):
+    """The reload seam stays before load_from_disk, just like construction."""
+    gate_calls = 0
+
+    def _project(**kwargs):
+        nonlocal gate_calls
+        gate_calls += 1
+        if gate_calls == 2:
+            Path(kwargs["memory_dir"], "MEMORY.md").write_text(
+                "task06-reprojected-at-compaction\n", encoding="utf-8"
+            )
+        return {"action": "allow"}
+
+    register_gate(_project)
+    agent = _make_agent(monkeypatch)
+    memory_store = getattr(agent, "_memory_store")
+    assert "task06-memory-line" in memory_store.format_for_system_prompt("memory")
+
+    agent._invalidate_system_prompt()
+
+    block = memory_store.format_for_system_prompt("memory")
+    assert gate_calls == 2
+    assert "task06-reprojected-at-compaction" in block
+    assert "task06-memory-line" not in block
