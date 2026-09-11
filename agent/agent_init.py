@@ -61,6 +61,18 @@ from utils import base_url_host_matches, is_truthy_value
 logger = logging.getLogger("run_agent")
 
 
+class MemoryLoadFailed(RuntimeError):
+    """A built-in ``MemoryStore`` load fault that must not be swallowed.
+
+    Failure class (b) of SPEC-2026-002 Delta 3. Upstream default keeps the
+    historical "memory is optional" swallow; a profile that sets
+    ``memory.pre_memory_load_required: true`` is memory-managed, so starting a
+    turn with zero memory is silent state loss and fails initialization
+    instead. Gate outcomes raise
+    :class:`hermes_cli.plugins.PreMemoryLoadBlocked` and never reach here.
+    """
+
+
 # Memory providers we've already warned are unavailable. Deduped because the
 # gateway builds a fresh AIAgent per message, so an un-deduped warning would
 # fire on every turn.
@@ -1916,6 +1928,63 @@ def init_agent(
         "memory" in _enabled_toolsets and "memory" not in _disabled_toolsets
     )
     if not skip_memory or _memory_toolset_requested:
+        # SPEC-2026-002 Task 6 — fail-closed pre-memory-load gate.
+        #
+        # This dispatch is deliberately OUTSIDE the try/except below (whose
+        # tail is ``except Exception: pass  # Memory is optional``). That
+        # except may swallow only genuine MemoryStore load faults; a gate
+        # outcome — block, raise, or timeout — must ALWAYS abort agent
+        # initialization loudly, on every construction path (CLI, gateway,
+        # cron, subagents), before any MEMORY.md bytes are frozen into the
+        # system-prompt snapshot. Plugin discovery has already run above, so
+        # a projection plugin's callback is registered by now. Do not move
+        # this inside the try (Delta 1).
+        _memory_cfg_section = {}
+        try:
+            from tools.memory_tool import (
+                get_builtin_memory_config as _get_builtin_memory_config,
+            )
+
+            _memory_cfg_section = _get_builtin_memory_config(_agent_cfg) or {}
+        except Exception:
+            logger.debug("Could not resolve memory config section", exc_info=True)
+        # is_truthy_value, not raw bool(): a quoted YAML string ("false",
+        # "no", "0", "off") must NOT enable required mode. Raw bool() treats
+        # any non-empty string as true, so a profile written with quotes would
+        # silently become memory-managed and abort startup when no plugin
+        # returns an explicit allow.
+        _pre_memory_load_required = is_truthy_value(
+            _memory_cfg_section.get("pre_memory_load_required"), default=False
+        )
+
+        from hermes_cli.plugins import (
+            enforce_pre_memory_load_gate as _enforce_pre_memory_load_gate,
+            has_hook as _has_plugin_hook,
+        )
+
+        if _pre_memory_load_required or _has_plugin_hook("pre_memory_load"):
+            from hermes_constants import get_hermes_home as _get_hermes_home
+            from tools.memory_tool import get_memory_dir as _get_memory_dir
+
+            # Keep the exact non-secret construction payload on the agent so
+            # every later load_from_disk() at the allowed compaction rebuild
+            # boundary can re-run the SAME gate before re-freezing MEMORY.md.
+            agent._pre_memory_load_gate_payload = {
+                "hermes_home": str(_get_hermes_home()),
+                "memory_dir": str(_get_memory_dir()),
+                "platform": getattr(agent, "platform", "") or "",
+                "session_id": getattr(agent, "session_id", "") or "",
+                "projection_source": str(
+                    _memory_cfg_section.get("projection_source") or ""
+                ),
+                "memory_char_limit": _memory_cfg_section.get("memory_char_limit", 2200),
+                "user_char_limit": _memory_cfg_section.get("user_char_limit", 1375),
+                "required": _pre_memory_load_required,
+                "skip_memory": bool(skip_memory),
+                "memory_toolset_requested": bool(_memory_toolset_requested),
+            }
+            _enforce_pre_memory_load_gate(**agent._pre_memory_load_gate_payload)
+
         try:
             from tools.memory_tool import (
                 get_builtin_memory_config,
@@ -1936,7 +2005,18 @@ def init_agent(
                     user_profile_enabled=agent._user_profile_enabled,
                 )
                 agent._memory_store.load_from_disk()
-        except Exception:
+        except Exception as _mem_load_err:
+            # Failure class (b): a genuine MemoryStore load fault. Upstream
+            # default keeps the historical swallow-and-run-empty behavior. A
+            # profile that marks the gate required is memory-managed, where
+            # running with zero memory is silent state loss — fail loud there.
+            # Gate outcomes never reach this handler: the gate runs above,
+            # outside this try (SPEC-2026-002 Delta 3).
+            if _pre_memory_load_required:
+                raise MemoryLoadFailed(
+                    "memory load failed while memory.pre_memory_load_required "
+                    f"is set: {_mem_load_err}"
+                ) from _mem_load_err
             pass  # Memory is optional -- don't break agent init
     
 

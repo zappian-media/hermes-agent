@@ -1075,6 +1075,15 @@ def invalidate_system_prompt(agent: Any) -> None:
     RAISES falls back to its last good section instead of vanishing
     (fail-open guard, not a freeze).
     """
+    # Re-run the same fail-closed pre_memory_load gate the agent ran at
+    # construction, BEFORE reloading memory from disk, so every set of bytes
+    # frozen into a rebuilt prompt is vetted too (not just the first).
+    gate_payload = getattr(agent, "_pre_memory_load_gate_payload", None)
+    if agent._memory_store and isinstance(gate_payload, dict):
+        from hermes_cli.plugins import enforce_pre_memory_load_gate
+
+        enforce_pre_memory_load_gate(**gate_payload)
+
     agent._cached_system_prompt = None
     agent._cached_system_prompt_static = None
     _snapshot_attr = "_plugin_system_prompt_sections_snapshot"

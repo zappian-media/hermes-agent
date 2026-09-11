@@ -1248,6 +1248,16 @@ def build_cache_parity_fork(
     review_agent._user_profile_enabled = agent._user_profile_enabled
     review_agent._memory_nudge_interval = 0
     review_agent._skill_nudge_interval = 0
+    # The fork inherits the parent's gate payload so that when a long review
+    # compacts and invalidate_system_prompt() re-freezes memory, it re-runs the
+    # SAME gate the parent ran. Without the graft the fork's getattr(...) is
+    # None and the gate silently steps aside - unvetted bytes get frozen into
+    # the shared store and the fork's prompt (red-team finding on hermes PR #3,
+    # tracks zappian-media/zappian-agents#41). A parent that never set a
+    # payload grafts None and the fork behaves exactly like the parent.
+    review_agent._pre_memory_load_gate_payload = getattr(
+        agent, "_pre_memory_load_gate_payload", None
+    )
     # PERSISTENCE ISOLATION (the curator-takeover root cause): the fork
     # shares the parent's session_id (set below, for prompt-cache
     # warmth), so without this it would write its harness turn ("Review

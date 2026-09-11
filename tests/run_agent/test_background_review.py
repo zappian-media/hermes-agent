@@ -885,3 +885,81 @@ def test_skill_patch_off_silent_verbose_shows_diff():
     )
     assert len(verbose) == 1
     assert "demo" in verbose[0] and "→" in verbose[0]
+
+
+# ---------------------------------------------------------------------------
+# pre_memory_load gate payload graft (hermes PR #3 red-team pin, #41).
+#
+# A long background review can hit context compaction. invalidate_system_prompt()
+# re-runs the fail-closed pre_memory_load gate before re-freezing MEMORY.md, but
+# ONLY when the agent carries _pre_memory_load_gate_payload. The review fork must
+# graft that payload from the parent right where it grafts the shared memory
+# store, or the gate finds nothing on the fork and silently steps aside — the
+# exact threat #41 was meant to kill, via the side door.
+#
+# Written against build_cache_parity_fork() because on this branch the memory
+# parity graft is inline there (the 0.20.6 fork had extracted it into
+# _apply_review_fork_memory_parity; that refactor is deliberately NOT carried
+# forward — this runtime is shared by live agents and the graft SITE is what
+# matters, not its packaging).
+# ---------------------------------------------------------------------------
+
+
+class _FakeForkAIAgent:
+    def __init__(self, **kwargs):
+        self.platform = kwargs.get("platform", "")
+        self.session_id = kwargs.get("parent_session_id", "") or "fork-session"
+        self.session_start = None
+        self._memory_store = None
+        self._memory_enabled = False
+        self._user_profile_enabled = False
+        self._cached_system_prompt = None
+        self._skip_mcp_refresh = False
+        self.suppress_status_output = False
+        self._persist_disabled = False
+        self._session_db = None
+        self._session_json_enabled = False
+        self._end_session_on_close = False
+
+
+def _fork_with_stubs(monkeypatch, parent):
+    from agent import background_review as _br
+    import run_agent as _run_agent_module
+
+    monkeypatch.setattr(_run_agent_module, "AIAgent", _FakeForkAIAgent)
+    monkeypatch.setattr(
+        _br,
+        "_resolve_review_runtime",
+        lambda agent, task_cfg=None: {
+            "model": agent.model,
+            "provider": agent.provider,
+            "routed": False,
+        },
+    )
+    return _br.build_cache_parity_fork(
+        parent, max_iterations=10, write_origin="background_review"
+    )
+
+
+def test_review_fork_grafts_gate_payload_from_parent(monkeypatch):
+    parent = _bare_agent()
+    payload = {"hermes_home": "/h", "memory_dir": "/h/memory", "required": True}
+    parent._pre_memory_load_gate_payload = payload
+
+    fork, _rt, routed = _fork_with_stubs(monkeypatch, parent)
+
+    assert routed is False
+    assert fork._memory_store is parent._memory_store
+    # The fork re-uses the parent's EXACT payload (identity), so a compaction
+    # on the fork re-runs the same gate instead of stepping aside.
+    assert fork._pre_memory_load_gate_payload is payload
+
+
+def test_review_fork_without_parent_gate_payload_grafts_none(monkeypatch):
+    """A parent with no gate configured grafts None — no behavior change."""
+    parent = _bare_agent()
+    assert not hasattr(parent, "_pre_memory_load_gate_payload")
+
+    fork, _rt, _routed = _fork_with_stubs(monkeypatch, parent)
+
+    assert getattr(fork, "_pre_memory_load_gate_payload", "MISSING") is None
