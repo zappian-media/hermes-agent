@@ -18,6 +18,7 @@ and BEFORE ``load_from_disk()``, dispatched OUTSIDE that ``try``:
 
 import ast
 import inspect
+import sys
 import threading
 from pathlib import Path
 
@@ -42,6 +43,30 @@ class _FakeOpenAI:
 
     def close(self):
         pass
+
+
+@pytest.fixture(autouse=True)
+def _rebind_plugins_module():
+    """Re-bind ``plugins_mod`` to the LIVE ``hermes_cli.plugins`` each test.
+
+    Constructing a real agent under a different HERMES_HOME makes the plugin
+    layer rebuild its per-profile submodule state, which replaces
+    ``sys.modules["hermes_cli.plugins"]`` with a NEW module object. This file's
+    module-level ``import hermes_cli.plugins as plugins_mod`` captured the
+    object that existed at collection time, so after such a neighbour runs
+    (tests/agent/test_empty_tool_name_loop_dampening.py is the one that bit us)
+    ``plugins_mod.PreMemoryLoadBlocked`` is a DIFFERENT class object from the
+    one agent_init raises - same name, same file, different generation. Every
+    ``pytest.raises`` here then reports DID NOT RAISE even though the gate
+    fired correctly with the right message.
+
+    Rebinding per test keeps the assertions pointed at the class the runtime
+    actually uses, so this file is order-independent. Nothing in the product
+    changes; this is purely test-module identity hygiene.
+    """
+    global plugins_mod
+    plugins_mod = sys.modules["hermes_cli.plugins"]
+    yield
 
 
 @pytest.fixture
@@ -394,6 +419,19 @@ def test_claude_code_block_shape_aborts_init(monkeypatch, hermes_home, register_
 
 
 def test_timeout_hook_aborts_init(monkeypatch, hermes_home, register_gate):
+    # Set the timeout in CONFIG, not only by patching the module attribute.
+    # _resolve_hook_callback_timeout() reads plugins.hook_callback_timeout, and
+    # building an agent under a fresh HERMES_HOME can rebuild the plugin
+    # layer's module state - which discards a patched module attribute but
+    # never the config. Without this the hung callback is measured against the
+    # 30s default, finishes first, and the gate correctly does NOT time out, so
+    # the test reports DID NOT RAISE for a reason that has nothing to do with
+    # the gate. The patch is kept as well: belt and braces, and it keeps the
+    # test honest when run alone.
+    (hermes_home / "config.yaml").write_text(
+        yaml.safe_dump({"plugins": {"hook_callback_timeout": 0.1}}),
+        encoding="utf-8",
+    )
     monkeypatch.setattr(plugins_mod, "_resolve_hook_callback_timeout", lambda: 0.1)
     hold = threading.Event()
 
