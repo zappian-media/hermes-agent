@@ -821,6 +821,11 @@ def invalidate_system_prompt(agent: Any) -> None:
     inside plugin-land. The previous bytes are stashed so a plugin whose render RAISES falls back to its
     last good section instead of vanishing (fail-open guard, not a freeze).
     """
+    # Re-run the construction-time fail-closed pre_memory_load gate before memory is re-frozen.
+    gate_payload = getattr(agent, "_pre_memory_load_gate_payload", None)
+    if agent._memory_store and isinstance(gate_payload, dict):
+        from hermes_cli.plugins import enforce_pre_memory_load_gate
+        enforce_pre_memory_load_gate(**gate_payload)
     agent._cached_system_prompt = None
     agent._cached_system_prompt_static = None
     if hasattr(agent, "_plugin_system_prompt_sections_snapshot"):
