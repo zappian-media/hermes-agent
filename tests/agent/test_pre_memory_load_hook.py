@@ -709,3 +709,138 @@ def test_compaction_reload_refreezes_bytes_written_by_the_gate(
     assert gate_calls == 2
     assert "task06-reprojected-at-compaction" in block
     assert "task06-memory-line" not in block
+
+
+# ---------------------------------------------------------------------------
+# 9. Promise-coverage gaps (FIXES.md Fix 1, points 4-7), added 2026-10-05
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize(
+    "directive",
+    [
+        {"action": "deny", "message": "m"},
+        {"decision": "deny", "reason": "m"},
+        {"action": "BLOCK", "message": "m"},
+        {"action": "  block ", "message": "m"},
+        {"decision": "Block", "reason": "m"},
+    ],
+)
+def test_every_block_or_deny_spelling_aborts_init(monkeypatch, hermes_home, register_gate, directive):
+    register_gate(lambda **kw: dict(directive))
+    with pytest.raises(plugins_mod.PreMemoryLoadBlocked) as exc:
+        _make_agent(monkeypatch)
+    assert "m" in str(exc.value)
+
+
+def test_block_without_a_message_still_aborts(monkeypatch, hermes_home, register_gate):
+    register_gate(lambda **kw: {"action": "block"})
+    with pytest.raises(plugins_mod.PreMemoryLoadBlocked):
+        _make_agent(monkeypatch)
+
+
+@pytest.mark.parametrize("order", ["allow_first", "block_first"])
+def test_one_blocking_callback_beats_an_allowing_one(monkeypatch, hermes_home, register_gate, order):
+    allow = lambda **kw: {"action": "allow"}
+    block = lambda **kw: {"action": "block", "message": "second opinion says stale"}
+    register_gate(*((allow, block) if order == "allow_first" else (block, allow)))
+    with pytest.raises(plugins_mod.PreMemoryLoadBlocked) as exc:
+        _make_agent(monkeypatch)
+    assert "second opinion says stale" in str(exc.value)
+
+
+@pytest.mark.parametrize("answer", [{"allow": True}, {"action": "proceed"}, {"action": "ALLOW"}])
+def test_required_gate_accepts_every_explicit_allow_spelling(monkeypatch, hermes_home, register_gate, answer):
+    _write_memory_config(hermes_home, pre_memory_load_required=True)
+    register_gate(lambda **kw: dict(answer))
+    agent = _make_agent(monkeypatch)
+    assert "task06-memory-line" in agent._memory_store.format_for_system_prompt("memory")
+
+
+@pytest.mark.parametrize("junk", ["allow", ["allow"], {"allow": "yes"}, {"action": "maybe"}, 1])
+def test_required_gate_treats_unclear_answers_as_no(monkeypatch, hermes_home, register_gate, junk):
+    _write_memory_config(hermes_home, pre_memory_load_required=True)
+    register_gate(lambda **kw: junk)
+    with pytest.raises(plugins_mod.PreMemoryLoadBlocked):
+        _make_agent(monkeypatch)
+
+
+def test_no_hook_and_not_required_never_dispatches(monkeypatch, hermes_home):
+    """Point 7: upstream behaviour is untouched, the hook machinery is not even entered."""
+    def _must_not_run(*a, **kw):
+        raise AssertionError("invoke_hook ran with no gate registered")
+    monkeypatch.setattr(plugins_mod, "invoke_hook", _must_not_run)
+    agent = _make_agent(monkeypatch)
+    assert "task06-memory-line" in agent._memory_store.format_for_system_prompt("memory")
+    assert getattr(agent, "_pre_memory_load_gate_payload", None) is None
+
+
+def test_no_hook_compaction_reload_is_unchanged(monkeypatch, hermes_home):
+    agent = _make_agent(monkeypatch)
+    (hermes_home / "memories" / "MEMORY.md").write_text("task06-after-compaction\n", encoding="utf-8")
+    agent._invalidate_system_prompt()
+    assert "task06-after-compaction" in agent._memory_store.format_for_system_prompt("memory")
+
+
+def test_required_compaction_reload_needs_an_allow_again(monkeypatch, hermes_home, register_gate):
+    """Point 3 + 6: required mode re-applies at every re-freeze, not only at startup."""
+    _write_memory_config(hermes_home, pre_memory_load_required=True)
+    answers = iter([{"action": "allow"}, None])
+    register_gate(lambda **kw: next(answers))
+    agent = _make_agent(monkeypatch)
+    with pytest.raises(plugins_mod.PreMemoryLoadBlocked) as exc:
+        agent._invalidate_system_prompt()
+    assert "required" in str(exc.value)
+
+
+def test_raising_gate_at_compaction_blocks_reload(monkeypatch, hermes_home, register_gate):
+    calls = []
+
+    def _gate(**kw):
+        calls.append(1)
+        if len(calls) > 1:
+            raise RuntimeError("projection service crashed mid-session")
+        return {"action": "allow"}
+
+    register_gate(_gate)
+    agent = _make_agent(monkeypatch)
+    loads = []
+    monkeypatch.setattr(agent._memory_store, "load_from_disk", lambda: loads.append(1))
+    with pytest.raises(plugins_mod.PreMemoryLoadBlocked):
+        agent._invalidate_system_prompt()
+    assert loads == []
+
+
+def test_review_fork_compaction_reruns_the_parents_gate(monkeypatch, hermes_home, register_gate):
+    """Point 4 end to end: a background-review fork that compacts is stopped by the same gate."""
+    from agent import background_review as _br
+    from agent.system_prompt import invalidate_system_prompt
+    import run_agent as _run_agent_module
+
+    calls = []
+
+    def _gate(**kw):
+        calls.append(kw)
+        return {"action": "allow"} if len(calls) == 1 else {"action": "block", "message": "fork stale"}
+
+    register_gate(_gate)
+    parent = _make_agent(monkeypatch)
+
+    class _Fork:
+        def __init__(self, **kwargs):
+            self.platform = kwargs.get("platform", "")
+            self.session_id = "fork-session"
+            self._memory_store = None
+            self._cached_system_prompt = None
+
+    monkeypatch.setattr(_run_agent_module, "AIAgent", _Fork)
+    monkeypatch.setattr(_br, "_resolve_review_runtime",
+                        lambda agent, task_cfg=None: {"model": "m", "provider": "openrouter", "routed": False})
+    fork, _rt, _routed = _br.build_cache_parity_fork(parent, max_iterations=2, write_origin="background_review")
+    loads = []
+    monkeypatch.setattr(fork._memory_store, "load_from_disk", lambda: loads.append(1))
+
+    with pytest.raises(plugins_mod.PreMemoryLoadBlocked) as exc:
+        invalidate_system_prompt(fork)
+    assert "fork stale" in str(exc.value)
+    assert calls[-1] == calls[0], "fork must re-run the gate with the parent's exact payload"
+    assert loads == []

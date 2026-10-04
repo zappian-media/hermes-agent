@@ -491,7 +491,9 @@ def _cron_native_memory_enabled(cfg: dict) -> bool:
     """``cron.native_memory_enabled`` (default true = upstream behaviour). Zappian: false enforces
     the no-double-writer rule — cron agents get ``skip_memory=True`` AND ``memory`` is stripped from
     their effective toolsets, closing agent init's ``_memory_toolset_requested`` re-widening path."""
-    return bool(((cfg or {}).get("cron") or {}).get("native_memory_enabled", True))
+    # is_truthy_value, not bool(): a quoted "false" / "no" / "0" must turn native memory OFF.
+    from utils import is_truthy_value
+    return is_truthy_value(((cfg or {}).get("cron") or {}).get("native_memory_enabled"), default=True)
 
 
 def _strip_memory_toolset_when_native_memory_disabled(toolsets: list[str], cfg: dict) -> list[str]:

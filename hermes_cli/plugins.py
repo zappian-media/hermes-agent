@@ -2190,7 +2190,7 @@ def _pre_memory_load_block_message(result: Any) -> Optional[str]:
         return None
     action = str(result.get("action") or "").strip().lower()
     decision = str(result.get("decision") or "").strip().lower()
-    if action in ("block", "deny") or decision == "block":
+    if action in ("block", "deny") or decision in ("block", "deny"):
         return str(result.get("message") or result.get("reason") or _PRE_MEMORY_LOAD_DEFAULT_BLOCK_MESSAGE)
     return None
 
