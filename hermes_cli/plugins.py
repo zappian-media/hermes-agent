@@ -54,8 +54,9 @@ from hermes_cli.plugins_dispatch import (  # noqa: F401 — re-exported
     DEFAULT_SYSTEM_PROMPT_SECTION_MAX_CHARS, HERMES_EVENT_NAMESPACE, MAX_SYSTEM_PROMPT_SECTION_CHARS,
     MAX_SYSTEM_PROMPT_SECTIONS_TOTAL_CHARS, PLUGIN_SECTIONS_END, PLUGIN_SECTIONS_START,
     SYSTEM_PROMPT_SECTION_POSITIONS, _EVENT_EMIT_DEPTH_CAP, _EVENT_PENDING_CAP,
-    _HOOK_CALLBACK_TIMEOUT_SECS, _HOOK_TIMEOUT_SUPPRESSION_SECONDS, _MAX_HOOK_CALLBACK_TIMEOUT_SECS,
-    _PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE, PluginDispatchMixin, PluginSystemPromptSection,
+    _HOOK_CALLBACK_TIMEOUT_SECS, _HOOK_ERROR_FAIL_CLOSED_HOOKS, _HOOK_TIMEOUT_BOUNDED_HOOKS,
+    _HOOK_TIMEOUT_FAIL_CLOSED_HOOKS, _HOOK_TIMEOUT_SUPPRESSION_SECONDS, _MAX_HOOK_CALLBACK_TIMEOUT_SECS,
+    _PRE_MEMORY_LOAD_TIMEOUT_BLOCK_MESSAGE, _PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE, PluginDispatchMixin, PluginSystemPromptSection,
     RenderedPluginSystemPromptSection, _EventSubscription, format_system_prompt_sections,
     is_valid_system_prompt_section_id,
 )
@@ -202,11 +203,22 @@ VALID_HOOKS: Set[str] = {
     # IGNORED in v1 — a plugin returning a directive-shaped dict gets a debug log so future block/rewrite
     # adopters are discoverable once the middleware variant ships against the #64231 taxonomy.
     "pre_command",
+    # pre_memory_load (Zappian): once per agent construction (CLI, gateway, cron, subagents) after plugin
+    # discovery and BEFORE MemoryStore.load_from_disk() freezes the memory snapshot, outside the memory
+    # block's swallowing handler; re-run before every later re-freeze (invalidate_system_prompt). The seam
+    # for a plugin that owns a projected MEMORY.md. FAIL-CLOSED: a block/deny directive ({"action":
+    # "block", "message"} or {"decision": "block", "reason"}), a raise, or a timeout aborts init with
+    # PreMemoryLoadBlocked. With memory.pre_memory_load_required, silence is not allow: some callback
+    # must return {"action": "allow"}. Kwargs: hermes_home, memory_dir, platform, session_id,
+    # projection_source, memory_char_limit, user_char_limit, required, skip_memory,
+    # memory_toolset_requested. Paths and identifiers only, never secrets.
+    "pre_memory_load",
 }
 
 # Hooks whose directive the shell-hook response parser has no channel for. VALID_HOOKS doubles as
 # the shell-hook allow-list, so these are refused loudly instead of having output silently ignored.
-SHELL_UNSUPPORTED_HOOKS: Set[str] = {"transform_api_error_classification"}
+# pre_memory_load: a dropped block directive would let memory load anyway — Python plugins only.
+SHELL_UNSUPPORTED_HOOKS: Set[str] = {"transform_api_error_classification", "pre_memory_load"}
 
 _env_enabled = env_var_enabled  # imported by plugins/memory
 _UNSET = object()
@@ -1933,10 +1945,11 @@ def _delivery_manager() -> PluginManager:
 def invoke_hook(hook_name: str, **kwargs: Any) -> List[Any]:
     """Invoke a lifecycle hook (lazy-discovers first); return non-``None`` callback results.
 
-    Hot-path / observer hooks in ``_HOOK_TIMEOUT_BOUNDED_HOOKS`` and the policy hook ``pre_tool_call`` are
-    bounded by ``plugins.hook_callback_timeout`` (default 30s). On timeout the worker is abandoned (not
-    joined) so we do not reintroduce the #6622 hang. Timed-out or still-running ``pre_tool_call`` callbacks
-    fail closed with a block directive; other bounded hooks fail open (skip).
+    Hot-path / observer hooks in ``_HOOK_TIMEOUT_BOUNDED_HOOKS`` and the policy hooks in
+    ``_HOOK_TIMEOUT_FAIL_CLOSED_HOOKS`` (``pre_tool_call``, ``pre_memory_load``) are bounded by
+    ``plugins.hook_callback_timeout`` (default 30s). On timeout the worker is abandoned (not joined) so we
+    do not reintroduce the #6622 hang. Timed-out, still-running or (``_HOOK_ERROR_FAIL_CLOSED_HOOKS``)
+    raising policy callbacks fail closed with a block directive; other bounded hooks fail open (skip).
     Ensures plugins are discovered on first invocation so callers in processes that never explicitly call
     ``discover_plugins()`` (gateway platform events, TUI slash workers, query mode, cron) still fire
     callbacks registered by user plugins (tracking #64178).
@@ -2158,6 +2171,66 @@ def _dispatch_pre_tool_call_hooks(
     block_msg = _resolve_block_from_details(
         details, tool_name, **{k: hook_kwargs.get(k, "") for k in ("turn_id", "tool_call_id", "session_id")})
     return (block_msg, details.modified_args)
+
+
+class PreMemoryLoadBlocked(RuntimeError):
+    """The fail-closed ``pre_memory_load`` gate refused the memory load; aborts agent init."""
+
+
+_PRE_MEMORY_LOAD_DEFAULT_BLOCK_MESSAGE = "plugin blocked the memory load"
+_PRE_MEMORY_LOAD_MISSING_ALLOW_MESSAGE = (
+    "memory.pre_memory_load_required is set for this profile but no "
+    "pre_memory_load plugin hook returned an explicit allow"
+)
+
+
+def _pre_memory_load_block_message(result: Any) -> Optional[str]:
+    """The block message carried by *result*, or ``None`` to allow."""
+    if not isinstance(result, dict):
+        return None
+    action = str(result.get("action") or "").strip().lower()
+    decision = str(result.get("decision") or "").strip().lower()
+    if action in ("block", "deny") or decision in ("block", "deny"):
+        return str(result.get("message") or result.get("reason") or _PRE_MEMORY_LOAD_DEFAULT_BLOCK_MESSAGE)
+    return None
+
+
+def _is_pre_memory_load_allow(result: Any) -> bool:
+    """Whether *result* is an EXPLICIT allow (only matters when the gate is required)."""
+    if not isinstance(result, dict):
+        return False
+    if str(result.get("action") or "").strip().lower() in ("allow", "proceed"):
+        return True
+    return result.get("allow") is True
+
+
+def get_pre_memory_load_block_message(**payload: Any) -> Optional[str]:
+    """Resolve the ``pre_memory_load`` gate to a block message, or ``None`` to allow.
+
+    Block / deny directives, raising callbacks and timed-out callbacks all block (first block in
+    registration order wins). No hook and ``required`` false: one dict probe, upstream behaviour.
+    ``required`` true: silence is not allow — some callback must return an explicit allow.
+    """
+    required = bool(payload.get("required"))
+    if not required and not has_hook("pre_memory_load"):
+        return None
+    allowed = False
+    for result in invoke_hook("pre_memory_load", **payload):
+        message = _pre_memory_load_block_message(result)
+        if message is not None:
+            return message
+        allowed = allowed or _is_pre_memory_load_allow(result)
+    if required and not allowed:
+        return _PRE_MEMORY_LOAD_MISSING_ALLOW_MESSAGE
+    return None
+
+
+def enforce_pre_memory_load_gate(**payload: Any) -> None:
+    """Raise :class:`PreMemoryLoadBlocked` when the gate refuses. Call sites must sit outside any
+    handler that swallows memory faults (see ``agent/agent_init.py``)."""
+    message = get_pre_memory_load_block_message(**payload)
+    if message is not None:
+        raise PreMemoryLoadBlocked(f"pre_memory_load gate aborted agent initialization: {message}")
 
 
 def get_pre_verify_continue_message(

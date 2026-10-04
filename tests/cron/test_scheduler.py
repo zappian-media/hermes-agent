@@ -657,6 +657,98 @@ class TestRunJobSessionPersistence:
             "memory toolset must not be policy-denied in cron"
         )
 
+    def test_run_job_native_memory_opt_out_forces_skip_memory(self, tmp_path):
+        """cron.native_memory_enabled: false opts cron agents out of native memory.
+
+        The job is silent about memory: the scheduler forces skip_memory=True
+        and strips memory from the platform-resolved enabled toolsets, so no
+        cron agent forks native memory (SPEC-2026-002 no-double-writer rule).
+        """
+        (tmp_path / "config.yaml").write_text("cron:\n  native_memory_enabled: false\n")
+        job = {
+            "id": "native-memory-optout-job",
+            "name": "test",
+            "prompt": "hello",
+        }
+        with self._run_job_patches(tmp_path) as (fake_db, mock_agent_cls):
+            run_job(job)
+
+        kwargs = mock_agent_cls.call_args.kwargs
+        assert kwargs["skip_memory"] is True
+        assert "memory" not in (kwargs["enabled_toolsets"] or [])
+        # The rest of platform toolset resolution is untouched.
+        assert "file" in (kwargs["enabled_toolsets"] or [])
+
+    def test_run_job_native_memory_opt_out_denies_per_job_memory_toolset(self, tmp_path):
+        """The opt-out wins over a per-job enabled_toolsets naming memory.
+
+        memory is stripped from the effective enabled toolsets AND
+        skip_memory=True, closing the _memory_toolset_requested re-widening
+        path in agent init (E11).
+        """
+        (tmp_path / "config.yaml").write_text("cron:\n  native_memory_enabled: false\n")
+        job = {
+            "id": "native-memory-optout-explicit-job",
+            "name": "test",
+            "prompt": "remember what you learn",
+            "enabled_toolsets": ["memory", "file"],
+        }
+        with self._run_job_patches(tmp_path) as (fake_db, mock_agent_cls):
+            run_job(job)
+
+        kwargs = mock_agent_cls.call_args.kwargs
+        assert kwargs["skip_memory"] is True
+        assert "memory" not in (kwargs["enabled_toolsets"] or [])
+        assert "file" in (kwargs["enabled_toolsets"] or [])
+
+    def test_run_job_native_memory_opt_out_never_loads_memory_store(self, tmp_path):
+        """With the opt-out, AIAgent construction from cron never calls
+        MemoryStore.load_from_disk — even for a job that names memory."""
+        (tmp_path / "config.yaml").write_text("cron:\n  native_memory_enabled: false\n")
+        job = {
+            "id": "native-memory-optout-no-load-job",
+            "name": "test",
+            "prompt": "remember what you learn",
+            "enabled_toolsets": ["memory", "file"],
+        }
+        # Bound BEFORE entering the patch context: _run_job_patches swaps
+        # run_agent.AIAgent for a mock, so an import inside the block would
+        # bind the mock instead of the real class.
+        from run_agent import AIAgent as RealAIAgent
+
+        with self._run_job_patches(tmp_path) as (fake_db, mock_agent_cls):
+            run_job(job)
+
+            kwargs = mock_agent_cls.call_args.kwargs
+            # Construct the real agent with exactly the kwargs cron produced
+            # and prove the native memory store is never loaded from disk.
+            with patch("tools.memory_tool.MemoryStore.load_from_disk") as mock_load:
+                RealAIAgent(**kwargs)
+            mock_load.assert_not_called()
+
+    @pytest.mark.parametrize("off", ["false", '"false"', '"no"', '"0"', '"off"', "no", "off", "0"])
+    def test_run_job_native_memory_opt_out_accepts_every_off_spelling(self, tmp_path, off):
+        """A quoted "false" must switch native memory OFF, not leave it silently on (2026-10-05)."""
+        (tmp_path / "config.yaml").write_text(f"cron:\n  native_memory_enabled: {off}\n")
+        job = {"id": f"optout-{abs(hash(off))}", "name": "test", "prompt": "hi",
+               "enabled_toolsets": ["memory", "file"]}
+        with self._run_job_patches(tmp_path) as (fake_db, mock_agent_cls):
+            run_job(job)
+        kwargs = mock_agent_cls.call_args.kwargs
+        assert kwargs["skip_memory"] is True
+        assert "memory" not in (kwargs["enabled_toolsets"] or [])
+
+    @pytest.mark.parametrize("on", ["true", '"true"', "yes", '"1"'])
+    def test_run_job_native_memory_explicitly_on_keeps_upstream_behaviour(self, tmp_path, on):
+        (tmp_path / "config.yaml").write_text(f"cron:\n  native_memory_enabled: {on}\n")
+        job = {"id": f"optin-{abs(hash(on))}", "name": "test", "prompt": "hi",
+               "enabled_toolsets": ["memory", "file"]}
+        with self._run_job_patches(tmp_path) as (fake_db, mock_agent_cls):
+            run_job(job)
+        kwargs = mock_agent_cls.call_args.kwargs
+        assert kwargs["skip_memory"] is False
+        assert "memory" in (kwargs["enabled_toolsets"] or [])
+
     def test_tick_skips_due_jobs_while_dispatch_is_paused(self, tmp_path):
         """The drain gate runs before advancing a due job's schedule."""
         from cron.scheduler import tick
@@ -2644,3 +2736,38 @@ class TestFailureStreakNudge:
         job = {"id": "old", "schedule": {"kind": "interval"}}  # pre-field job
         with patch("cron.scheduler.load_config", return_value={}):
             assert _failure_streak_nudge(job) == ""
+
+
+# ---------------------------------------------------------------------------
+# Zappian Fix 2: the config switch itself (FIXES.md Fix 2, point 1), added 2026-10-05
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize(
+    "cfg,expected",
+    [
+        (None, True),
+        ({}, True),
+        ({"cron": None}, True),
+        ({"cron": {}}, True),
+        ({"cron": {"native_memory_enabled": None}}, True),
+        ({"cron": {"native_memory_enabled": True}}, True),
+        ({"cron": {"native_memory_enabled": False}}, False),
+        ({"cron": {"native_memory_enabled": "false"}}, False),
+        ({"cron": {"native_memory_enabled": "False "}}, False),
+        ({"cron": {"native_memory_enabled": "no"}}, False),
+        ({"cron": {"native_memory_enabled": 0}}, False),
+        ({"cron": {"native_memory_enabled": "yes"}}, True),
+    ],
+)
+def test_cron_native_memory_switch_parsing(cfg, expected):
+    from cron.scheduler import _cron_native_memory_enabled
+    assert _cron_native_memory_enabled(cfg) is expected
+
+
+def test_strip_memory_toolset_only_when_switched_off():
+    from cron.scheduler import _strip_memory_toolset_when_native_memory_disabled as strip
+    off = {"cron": {"native_memory_enabled": "false"}}
+    assert strip(["memory", "file"], off) == ["file"]
+    assert strip(["file"], off) == ["file"]
+    assert strip([], off) == []
+    assert strip(["memory", "file"], {}) == ["memory", "file"]
