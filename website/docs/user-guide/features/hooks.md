@@ -392,8 +392,8 @@ def register(ctx):
 **General rules for all hooks:**
 
 - Callbacks receive **keyword arguments**. Always accept `**kwargs` for forward compatibility.
-- Callback exceptions are logged and skipped; later callbacks continue. A callback that fails the same way on every call (typically a signature naming a field the hook does not send, e.g. `tool_data` instead of `tool_name`/`args`) is reported **once** at WARNING — the message lists the fields the hook provides — and identical repeats go to DEBUG, so a mis-declared plugin cannot flood the log.
-- If a Python plugin callback on a **timeout-bounded** hook (hot-path observers such as `post_tool_call` / `pre_llm_call`, plus the policy hook `pre_tool_call`) **blocks** longer than `plugins.hook_callback_timeout` (default 30s, set `0` to disable, max 600), it is abandoned without joining the worker so the agent loop continues. Timed-out or still-running `pre_tool_call` callbacks **fail closed** (block the tool); other bounded hooks fail open (skip). Hooks with a documented caller-thread contract (`subagent_stop`) are never moved onto a timeout worker. Shell hooks keep their own per-entry `timeout`.
+- Callback exceptions are logged and skipped; later callbacks continue (the policy hooks `pre_tool_call` and `pre_memory_load` instead turn a raise into a block). A callback that fails the same way on every call (typically a signature naming a field the hook does not send, e.g. `tool_data` instead of `tool_name`/`args`) is reported **once** at WARNING — the message lists the fields the hook provides — and identical repeats go to DEBUG, so a mis-declared plugin cannot flood the log.
+- If a Python plugin callback on a **timeout-bounded** hook (hot-path observers such as `post_tool_call` / `pre_llm_call`, plus the policy hook `pre_tool_call`) **blocks** longer than `plugins.hook_callback_timeout` (default 30s, set `0` to disable, max 600), it is abandoned without joining the worker so the agent loop continues. Timed-out or still-running `pre_tool_call` callbacks **fail closed** (block the tool), and so do `pre_memory_load` callbacks (abort agent initialization); other bounded hooks fail open (skip). Hooks with a documented caller-thread contract (`subagent_stop`) are never moved onto a timeout worker. Shell hooks keep their own per-entry `timeout`.
 - The catalog below is descriptive: **observers** ignore returns, **transforms** accept the first valid string replacement, and **directive/control** hooks consume documented return shapes. Plugin middleware is a separate registry and surface, not another hook category.
 - Correlation fields such as `turn_id`, `api_request_id`, `task_id`, `session_id`, and `api_call_count` are hook-specific and may be absent. Treat IDs as opaque.
 - Runtime event-name validity comes from `hermes_cli.plugins.VALID_HOOKS`. `hermes hooks list` lists configured shell/outbound hooks, not every available event; `hermes hooks test <event>` reports the valid set only when an invalid event is supplied.
@@ -476,6 +476,7 @@ Payload fields below are the exact event-specific fields supplied by each call s
 | `subagent_start` | Observer | Child constructed and about to run; return ignored. | `parent_session_id`, `parent_turn_id`, `parent_subagent_id`, `child_session_id`, `child_subagent_id`, `child_role`, `child_goal` | Child goal may contain user/project content. |
 | `subagent_stop` | Observer | Child exit; return ignored. | `parent_session_id`, `parent_turn_id`, `child_session_id`, `child_role`, `child_summary`, `child_status`, `tool_call_history`, `duration_ms` | Summary and redacted tool-history metadata may reveal project structure. |
 | `pre_gateway_dispatch` | Directive/control | Incoming non-internal message before auth/pairing/dispatch; first valid `skip`, `rewrite`, or `allow` controls flow. | `event`, `gateway`, `session_store` | Extremely privileged in-process objects expose inbound user/routing data and host handles. |
+| [`pre_memory_load`](#pre_memory_load) | Directive/control | Before every `MemoryStore.load_from_disk()` that freezes a system-prompt memory snapshot: at construction (CLI, gateway, cron, subagents) and at the context-compression rebuild boundary. **Fail-closed:** a `block` directive, a raising callback, or a timeout aborts the memory load. | `hermes_home`, `memory_dir`, `platform`, `session_id`, `projection_source`, `memory_char_limit`, `user_char_limit`, `required`, `skip_memory`, `memory_toolset_requested` | Profile-scoped paths and identifiers only; never memory content or secrets. |
 | `gateway_platform_event` | Observer | After the gateway's profile-scoped authorization succeeds, when a supported platform-native event is normalized at the gateway boundary (Telegram: reactions, message edits; Discord: message edits/deletes, thread created/renamed); return ignored. | `platform`, `event_type`, `payload` (event-type-specific dict — see the per-event contracts below) | Normalized plain-dict envelope only; raw SDK objects, adapter handles, and bot clients are never exposed. |
 | `pre_command` | Observer | Recognized slash command about to be dispatched, before the handler runs, on CLI and gateway cold-path dispatch; return ignored in v1 (directive-shaped dicts are logged at debug). Gateway running-agent intercept commands (`/stop`, `/approve` during an active run) are deliberately excluded — control-plane escape hatches must stay outside plugin reach. | `surface` (`"cli"` \| `"gateway"`), `command` (canonical name), `alias_used`, `args_raw`, `session_key`, `platform` | `args_raw` may contain user content or secrets typed after the command. |
 | `pre_approval_request` | Observer | Before prompted or smart approval; return ignored. | `command`, `description`, `pattern_key`, `pattern_keys`, `session_key`, `surface`, `turn_id`, `tool_call_id` | Command may contain secrets; smart observer preparation force-redacts, but surfaces do not all have identical redaction. |
@@ -1272,6 +1273,78 @@ def register(ctx):
 
 ---
 
+### `pre_memory_load`
+
+Fires immediately **before every** `MemoryStore.load_from_disk()` that can freeze `MEMORY.md` / `USER.md` into a system prompt: once at agent construction (CLI, query mode, gateway, cron, and subagents), after plugin discovery, and again when context compression invalidates and rebuilds the prompt. Background-review forks inherit the parent's gate, so a fork that compacts re-runs it too.
+
+The dispatch is deliberately **outside** the memory block's "memory is optional" exception guard in `agent/agent_init.py`. That guard may swallow only genuine `MemoryStore` load faults; a gate outcome always surfaces.
+
+**Callback signature:**
+
+```python
+def my_callback(memory_dir, hermes_home, platform, session_id, **kwargs):
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `hermes_home` | `str` | Profile-scoped `HERMES_HOME`. |
+| `memory_dir` | `str` | The `$HERMES_HOME/memories` directory that is about to be read. |
+| `platform` | `str` | `"cli"`, `"telegram"`, `"cron"`, … |
+| `session_id` | `str` | The session this construction belongs to. |
+| `projection_source` | `str` | `memory.projection_source` from config, or `""` — where the projected `MEMORY.md` is generated from. |
+| `memory_char_limit` / `user_char_limit` | `int` | Configured budgets for the two stores. |
+| `required` | `bool` | Whether `memory.pre_memory_load_required` is set for this profile. |
+| `skip_memory` / `memory_toolset_requested` | `bool` | Why the load is happening (a flush/background agent that names the `memory` toolset sets the latter). |
+
+No memory content and no secret values are ever passed.
+
+**Return value — FAIL-CLOSED.** Unlike observer hooks, a failure here is not absorbed:
+
+| Return / outcome | Effect |
+|------------------|--------|
+| `None`, `{"action": "allow"}`, anything not a block directive | Memory loads normally. |
+| `{"action": "block", "message": "..."}` (or `{"action": "deny", ...}`) | Initialization aborts with `PreMemoryLoadBlocked`. |
+| `{"decision": "block", "reason": "..."}` | Same — the Claude-Code shape is accepted. |
+| Callback **raises** (including `SystemExit` / `KeyboardInterrupt` on the timeout worker) | Aborts, carrying the exception text. |
+| Callback exceeds `plugins.hook_callback_timeout` (or is still running from a previous fire) | Aborts. |
+
+The first block in registration order wins. Nothing is loaded when the gate blocks — no stale bytes reach the prompt.
+
+**Rewriting the projection.** Because the hook runs before the load, a plugin that owns a *derived* `MEMORY.md` can regenerate it in the callback and the frozen snapshot will contain the new bytes:
+
+```python
+def project_memory(memory_dir, **kwargs):
+    try:
+        render_projection(Path(memory_dir) / "MEMORY.md")
+    except Exception as exc:
+        # Fail closed: better to abort than to run on a stale projection.
+        return {"action": "block", "message": f"projection failed: {exc}"}
+    return {"action": "allow"}
+
+def register(ctx):
+    ctx.register_hook("pre_memory_load", project_memory)
+```
+
+**Two failure classes, named per profile.** A *gate* failure always aborts, on every profile and surface. A *non-hook* `MemoryStore` load failure (unreadable `MEMORY.md`, corrupt file) keeps the historical swallow-and-run-empty behavior by default. Setting
+
+```yaml
+memory:
+  pre_memory_load_required: true
+```
+
+declares the gate a hard dependency for that profile and changes both halves:
+
+- silence is no longer allow — some callback must return `{"action": "allow"}`, so a missing or unloaded projection plugin aborts instead of quietly falling back to whatever is on disk;
+- a `MemoryStore` load fault raises `MemoryLoadFailed` instead of being swallowed, because a memory-managed agent running with zero memory is silent state loss.
+
+Leave the flag unset (the default) and behavior with no registered hook is identical to a build without this hook.
+
+:::caution
+This hook is Python-plugin only. Shell hooks cannot return its directive, so a `hooks.pre_memory_load` config entry is refused with a warning rather than registered as a gate that can never actually block.
+:::
+
+---
+
 ### `gateway_platform_event`
 
 Fires for supported platform-native events only **after** the gateway's normal, profile-scoped authorization check succeeds. The callback receives plain dictionaries; raw SDK objects, adapter handles, bot clients, and callback contexts are never part of this stable contract.
@@ -1716,7 +1789,7 @@ hooks:
 hooks_auto_accept: false         # See "Consent model" below
 ```
 
-Event names must be one of the [plugin hook events](#plugin-hooks); typos produce a "Did you mean X?" warning and are skipped. Unknown keys inside a single entry are ignored; missing `command` is a skip-with-warning. `timeout > 300` is clamped with a warning. `fail_closed: true` on an event other than `pre_tool_call` warns and is ignored (only blocking-capable events can fail closed).
+Event names must be one of the [plugin hook events](#plugin-hooks); typos produce a "Did you mean X?" warning and are skipped. Unknown keys inside a single entry are ignored; missing `command` is a skip-with-warning. `timeout > 300` is clamped with a warning. `fail_closed: true` on an event other than `pre_tool_call` warns and is ignored (only blocking-capable events can fail closed). `pre_memory_load` cannot be registered from a shell hook at all: shell stdout has no channel for its directive, so the registration is refused with a warning instead of silently dropping a refusal.
 
 On Windows, a `command` that starts with an existing script file — the `~/.hermes/agent-hooks/x.sh` shape the examples below use — is spawned through that file's own interpreter (Git Bash for `.sh`/`.bash`, the running Hermes Python for `.py`), because `CreateProcess` has no shebang support and rejects a bare script with `WinError 193`. Every other command, and every POSIX platform, passes `argv` straight to `Popen`, where the kernel already honours the shebang.
 
