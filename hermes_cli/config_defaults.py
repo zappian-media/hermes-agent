@@ -1318,11 +1318,6 @@ DEFAULT_CONFIG = {
         # true = foreground writes prompt inline; background writes are staged (/memory
         # pending|approve <id>|reject <id>). To disable memory: memory_enabled.
         "write_approval": False,
-        # Zappian: is the fail-closed pre_memory_load plugin gate a hard dependency? false = upstream
-        # behaviour (no hook -> loads unchanged; a store load fault runs empty). true = a callback must
-        # return an explicit allow, and a store load fault raises instead of running empty. Gate
-        # refusals (block, raise, timeout) abort init either way.
-        "pre_memory_load_required": False,
         "memory_char_limit": 2200,   # ~800 tokens at 2.75 chars/token
         "user_char_limit": 1375,     # ~500 tokens at 2.75 chars/token
         # Periodic built-in memory review; 0 when an external provider auto-extracts.

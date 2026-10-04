@@ -48,12 +48,6 @@ from utils import base_url_host_matches, is_truthy_value
 logger = logging.getLogger("run_agent")
 
 
-class MemoryLoadFailed(RuntimeError):
-    """A built-in ``MemoryStore`` load fault on a profile with ``memory.pre_memory_load_required``:
-    running memory-managed with zero memory is silent state loss, so init fails instead of
-    swallowing it. Gate refusals raise ``hermes_cli.plugins.PreMemoryLoadBlocked``, not this."""
-
-
 # Deduped: the gateway builds a fresh AIAgent per message, so it would warn every turn.
 _warned_unavailable_providers: set[tuple[str, str]] = set()
 
@@ -1350,41 +1344,8 @@ def _init_memory(agent, _agent_cfg, skip_memory, platform, memory_manager=None):
         and "memory" not in (agent.disabled_toolsets or [])
     )
     if not skip_memory or _memory_toolset_requested:
-        # Fail-closed pre_memory_load gate (Zappian). Deliberately OUTSIDE the swallowing try below:
-        # a block / raise / timeout must abort init on every surface before MEMORY.md is frozen.
-        # Plugin discovery has already run, so a projection plugin's callback is registered.
-        _memory_cfg_section = {}
+        # Memory is optional — don't break agent init
         with suppress(Exception):
-            from tools.memory_tool import get_builtin_memory_config as _get_builtin_memory_config
-            _memory_cfg_section = _get_builtin_memory_config(_agent_cfg) or {}
-        # is_truthy_value, not bool(): a quoted "false" / "no" / "0" must not enable required mode.
-        _pre_memory_load_required = is_truthy_value(
-            _memory_cfg_section.get("pre_memory_load_required"), default=False
-        )
-        from hermes_cli.plugins import (
-            enforce_pre_memory_load_gate as _enforce_pre_memory_load_gate, has_hook as _has_plugin_hook,
-        )
-        if _pre_memory_load_required or _has_plugin_hook("pre_memory_load"):
-            from hermes_constants import get_hermes_home as _get_hermes_home
-            from tools.memory_tool import get_memory_dir as _get_memory_dir
-            # Saved on the agent so every later re-freeze (invalidate_system_prompt, review forks)
-            # re-runs the SAME gate before load_from_disk().
-            agent._pre_memory_load_gate_payload = {
-                "hermes_home": str(_get_hermes_home()),
-                "memory_dir": str(_get_memory_dir()),
-                "platform": getattr(agent, "platform", "") or "",
-                "session_id": getattr(agent, "session_id", "") or "",
-                "projection_source": str(_memory_cfg_section.get("projection_source") or ""),
-                "memory_char_limit": _memory_cfg_section.get("memory_char_limit", 2200),
-                "user_char_limit": _memory_cfg_section.get("user_char_limit", 1375),
-                "required": _pre_memory_load_required,
-                "skip_memory": bool(skip_memory),
-                "memory_toolset_requested": bool(_memory_toolset_requested),
-            }
-            _enforce_pre_memory_load_gate(**agent._pre_memory_load_gate_payload)
-
-        # try/except, not suppress(): required mode must be able to re-raise a load fault.
-        try:
             from tools.memory_tool import (
                 MemoryStore, get_builtin_memory_config, get_builtin_memory_store_flags,
             )
@@ -1401,12 +1362,6 @@ def _init_memory(agent, _agent_cfg, skip_memory, platform, memory_manager=None):
                     user_profile_enabled=agent._user_profile_enabled,
                 )
                 agent._memory_store.load_from_disk()
-        except Exception as _mem_load_err:
-            if _pre_memory_load_required:
-                raise MemoryLoadFailed(
-                    f"memory load failed while memory.pre_memory_load_required is set: {_mem_load_err}"
-                ) from _mem_load_err
-            pass  # Memory is optional — don't break agent init
 
     # External memory provider plugin (one at a time, alongside built-in): memory.provider.
     agent._memory_manager = None

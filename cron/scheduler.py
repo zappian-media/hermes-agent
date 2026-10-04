@@ -487,23 +487,6 @@ def _merge_mcp_into_per_job_toolsets(per_job: list[str], cfg: dict) -> list[str]
     return result
 
 
-def _cron_native_memory_enabled(cfg: dict) -> bool:
-    """``cron.native_memory_enabled`` (default true = upstream behaviour). Zappian: false enforces
-    the no-double-writer rule — cron agents get ``skip_memory=True`` AND ``memory`` is stripped from
-    their effective toolsets, closing agent init's ``_memory_toolset_requested`` re-widening path."""
-    # is_truthy_value, not bool(): a quoted "false" / "no" / "0" must turn native memory OFF.
-    from utils import is_truthy_value
-    return is_truthy_value(((cfg or {}).get("cron") or {}).get("native_memory_enabled"), default=True)
-
-
-def _strip_memory_toolset_when_native_memory_disabled(toolsets: list[str], cfg: dict) -> list[str]:
-    """Drop ``memory`` from a resolved enabled-toolset list when native cron memory is opted out."""
-    if not toolsets or "memory" not in toolsets or _cron_native_memory_enabled(cfg):
-        return toolsets
-    logger.info("cron.native_memory_enabled=false: stripped 'memory' from the effective enabled toolsets")
-    return [t for t in toolsets if t != "memory"]
-
-
 def _resolve_cron_enabled_toolsets(job: dict, cfg: dict) -> list[str]:
     """Toolset list for a cron job. Precedence: per-job ``enabled_toolsets`` (+ MCP merge) >
     ``cron`` platform config (``_get_platform_tools``, which strips _DEFAULT_OFF_TOOLSETS so fresh
@@ -520,17 +503,15 @@ def _resolve_cron_enabled_toolsets(job: dict, cfg: dict) -> list[str]:
     """
     per_job = job.get("enabled_toolsets")
     if per_job:
-        return _strip_memory_toolset_when_native_memory_disabled(
-            _merge_mcp_into_per_job_toolsets(list(per_job), cfg or {}), cfg)
+        return _merge_mcp_into_per_job_toolsets(list(per_job), cfg or {})
     try:
         from hermes_cli.tools_config import _get_platform_tools  # lazy: avoid heavy import at cron module load
-        platform_toolsets = sorted(_get_platform_tools(cfg or {}, "cron"))
+        return sorted(_get_platform_tools(cfg or {}, "cron"))
     except Exception as exc:
         raise RuntimeError(
             "Cron toolset resolution failed, so this run was refused rather than given every "
             f"tool. Check `platform_toolsets.cron` in config.yaml (`hermes cron doctor`): {exc}"
         ) from exc
-    return _strip_memory_toolset_when_native_memory_disabled(platform_toolsets, cfg)
 
 
 def _resolve_job_reasoning_config(job: dict, cfg: dict, model: str) -> dict | None:
@@ -2547,7 +2528,7 @@ def _construct_cron_agent(AIAgent, job: dict, _cfg: dict, setup: _CronAgentSetup
         # Project context files only with a configured workdir; SOUL.md always.
         skip_context_files=not bool(workdir),
         load_soul_identity=True,
-        skip_memory=not _cron_native_memory_enabled(_cfg),  # cron.native_memory_enabled opt-out (Zappian)
+        skip_memory=False,
         skip_background_review=True,  # Cron has no human-in-the-loop need for skill/memory review forks (~30K tok/event)
         platform="cron",
         session_id=session_id,
