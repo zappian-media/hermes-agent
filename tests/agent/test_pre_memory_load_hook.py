@@ -917,3 +917,38 @@ def test_malformed_memory_section_cannot_hide_required(monkeypatch, hermes_home)
         "memory: >\n  pre_memory_load_required: true\n", encoding="utf-8")
     with pytest.raises(plugins_mod.PreMemoryLoadBlocked):
         _make_agent(monkeypatch)
+
+
+_UNPARSEABLE_TRAILER = "\nbroken: [unclosed\n"
+
+
+@pytest.mark.parametrize("body", [
+    "memory: {pre_memory_load_required: true}",
+    "memory: {memory_char_limit: 1,\n  pre_memory_load_required: true}",
+    "memory:\n  pre_memory_load_required: true,",
+    'memory:\n  "pre_memory_load_required": true',
+    "memory:\n  'pre_memory_load_required': yes",
+    "base: &b\n  pre_memory_load_required: true\nmemory:\n  <<: *b",
+    "flag: &r true\nmemory:\n  pre_memory_load_required: *r",
+    "memory:\n  pre_memory_load_required: &r true",
+    "memory:\n  pre_memory_load_required: !!bool true",
+    "memory:\n  pre_memory_load_required: ${REQUIRE_GATE}",
+    "memory:\n  - pre_memory_load_required: true",
+    "memory:\n  pre_memory_load_required: true\n  pre_memory_load_required: false",
+])
+def test_any_written_form_of_required_fails_closed_on_a_broken_config(monkeypatch, hermes_home, body):
+    (hermes_home / "config.yaml").write_text(body + _UNPARSEABLE_TRAILER, encoding="utf-8")
+    with pytest.raises(plugins_mod.PreMemoryLoadBlocked):
+        _make_agent(monkeypatch)
+
+
+@pytest.mark.parametrize("body", [
+    "memory:\n  pre_memory_load_required: false",
+    "memory:\n  pre_memory_load_required: 'no'",
+    'memory: {pre_memory_load_required: "off", memory_char_limit: 1}',
+    "memory:\n  pre_memory_load_required: 0  # explicit",
+])
+def test_explicitly_off_required_on_a_broken_config_loads_memory(monkeypatch, hermes_home, body):
+    (hermes_home / "config.yaml").write_text(body + _UNPARSEABLE_TRAILER, encoding="utf-8")
+    agent = _make_agent(monkeypatch)
+    assert "task06-memory-line" in agent._memory_store.format_for_system_prompt("memory")
