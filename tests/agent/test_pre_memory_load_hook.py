@@ -952,3 +952,13 @@ def test_explicitly_off_required_on_a_broken_config_loads_memory(monkeypatch, he
     (hermes_home / "config.yaml").write_text(body + _UNPARSEABLE_TRAILER, encoding="utf-8")
     agent = _make_agent(monkeypatch)
     assert "task06-memory-line" in agent._memory_store.format_for_system_prompt("memory")
+
+
+@pytest.mark.parametrize("body", [
+    "memory:\n  my_pre_memory_load_required: true",
+    "memory:\n  pre_memory_load_required_note: true",
+])
+def test_similar_key_names_do_not_require_the_gate(monkeypatch, hermes_home, body):
+    (hermes_home / "config.yaml").write_text(body + _UNPARSEABLE_TRAILER, encoding="utf-8")
+    agent = _make_agent(monkeypatch)
+    assert "task06-memory-line" in agent._memory_store.format_for_system_prompt("memory")

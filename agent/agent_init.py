@@ -57,7 +57,9 @@ class MemoryLoadFailed(RuntimeError):
 # The raw fallback does not try to parse YAML values (flow style, anchors, aliases, tags, env vars,
 # quoted keys all defeat a value regex). Any uncommented mention of the key means required, unless
 # that mention is a plain explicit "off" value.
-_PRE_MEMORY_LOAD_REQUIRED_KEY = re.compile(r"pre_memory_load_required", re.IGNORECASE)
+# Whole key only (not my_pre_memory_load_required). Inline `# ...` text is NOT stripped: a `#` inside
+# a quoted value earlier on the line would then hide a real key, and a false "required" is the safe side.
+_PRE_MEMORY_LOAD_REQUIRED_KEY = re.compile(r"(?<![A-Za-z0-9_])pre_memory_load_required(?![A-Za-z0-9_])", re.IGNORECASE)
 _PRE_MEMORY_LOAD_REQUIRED_OFF = re.compile(
     r"""["']?[ \t]*:[ \t]*["']?(?:false|no|off|0)["']?[ \t]*(?:[,}\]#]|$)""", re.IGNORECASE
 )
