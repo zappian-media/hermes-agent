@@ -54,6 +54,37 @@ class MemoryLoadFailed(RuntimeError):
     swallowing it. Gate refusals raise ``hermes_cli.plugins.PreMemoryLoadBlocked``, not this."""
 
 
+_PRE_MEMORY_LOAD_REQUIRED_LINE = re.compile(
+    r"""^[ \t]*pre_memory_load_required[ \t]*:[ \t]*["']?([^"'#\s]+)""", re.IGNORECASE | re.MULTILINE
+)
+
+
+def _memory_cfg_read_cleanly(cfg: Any) -> bool:
+    """False when ``cfg`` is a fallback for an unreadable config.yaml (``FailedConfigRead``, the
+    ``{}`` a failed load leaves) or its ``memory`` section is not a mapping: such a config cannot
+    say that ``pre_memory_load_required`` is off."""
+    from hermes_cli.config_read_errors import FailedConfigRead
+    if not isinstance(cfg, dict) or not cfg or isinstance(cfg, FailedConfigRead):
+        return False
+    return "memory" not in cfg or isinstance(cfg.get("memory"), dict)
+
+
+def _raw_config_requests_pre_memory_load() -> bool:
+    """Fail-closed reading of the profile's config.yaml text, for when the parsed config is not
+    trustworthy. True if any uncommented ``pre_memory_load_required:`` line is truthy, or the file
+    exists but cannot be read. No file means the defaults apply (required off)."""
+    from hermes_cli.config import get_config_path
+    try:
+        path = get_config_path()
+        if not path.exists():
+            return False
+        text = path.read_text(encoding="utf-8-sig", errors="replace")
+    except Exception:
+        return True
+    return any(is_truthy_value(m.group(1), default=False)
+               for m in _PRE_MEMORY_LOAD_REQUIRED_LINE.finditer(text))
+
+
 # Deduped: the gateway builds a fresh AIAgent per message, so it would warn every turn.
 _warned_unavailable_providers: set[tuple[str, str]] = set()
 
@@ -1354,13 +1385,22 @@ def _init_memory(agent, _agent_cfg, skip_memory, platform, memory_manager=None):
         # a block / raise / timeout must abort init on every surface before MEMORY.md is frozen.
         # Plugin discovery has already run, so a projection plugin's callback is registered.
         _memory_cfg_section = {}
-        with suppress(Exception):
+        _memory_cfg_trusted = True
+        try:
             from tools.memory_tool import get_builtin_memory_config as _get_builtin_memory_config
             _memory_cfg_section = _get_builtin_memory_config(_agent_cfg) or {}
+        except Exception:
+            _memory_cfg_trusted = False
         # is_truthy_value, not bool(): a quoted "false" / "no" / "0" must not enable required mode.
         _pre_memory_load_required = is_truthy_value(
             _memory_cfg_section.get("pre_memory_load_required"), default=False
         )
+        # A config that could not be read cleanly (fallback, failed load, malformed memory section)
+        # cannot vouch that required mode is off: decide from the file's own text, fail closed.
+        if not _pre_memory_load_required and not (
+            _memory_cfg_trusted and _memory_cfg_read_cleanly(_agent_cfg)
+        ):
+            _pre_memory_load_required = _raw_config_requests_pre_memory_load()
         from hermes_cli.plugins import (
             enforce_pre_memory_load_gate as _enforce_pre_memory_load_gate, has_hook as _has_plugin_hook,
         )
