@@ -54,8 +54,12 @@ class MemoryLoadFailed(RuntimeError):
     swallowing it. Gate refusals raise ``hermes_cli.plugins.PreMemoryLoadBlocked``, not this."""
 
 
-_PRE_MEMORY_LOAD_REQUIRED_LINE = re.compile(
-    r"""^[ \t]*pre_memory_load_required[ \t]*:[ \t]*["']?([^"'#\s]+)""", re.IGNORECASE | re.MULTILINE
+# The raw fallback does not try to parse YAML values (flow style, anchors, aliases, tags, env vars,
+# quoted keys all defeat a value regex). Any uncommented mention of the key means required, unless
+# that mention is a plain explicit "off" value.
+_PRE_MEMORY_LOAD_REQUIRED_KEY = re.compile(r"pre_memory_load_required", re.IGNORECASE)
+_PRE_MEMORY_LOAD_REQUIRED_OFF = re.compile(
+    r"""["']?[ \t]*:[ \t]*["']?(?:false|no|off|0)["']?[ \t]*(?:[,}\]#]|$)""", re.IGNORECASE
 )
 
 
@@ -71,8 +75,8 @@ def _memory_cfg_read_cleanly(cfg: Any) -> bool:
 
 def _raw_config_requests_pre_memory_load() -> bool:
     """Fail-closed reading of the profile's config.yaml text, for when the parsed config is not
-    trustworthy. True if any uncommented ``pre_memory_load_required:`` line is truthy, or the file
-    exists but cannot be read. No file means the defaults apply (required off)."""
+    trustworthy. True if any uncommented mention of ``pre_memory_load_required`` is anything but a
+    plain false/no/off/0, or the file exists but cannot be read. No file means required is off."""
     from hermes_cli.config import get_config_path
     try:
         path = get_config_path()
@@ -80,9 +84,17 @@ def _raw_config_requests_pre_memory_load() -> bool:
             return False
         text = path.read_text(encoding="utf-8-sig", errors="replace")
     except Exception:
+        logger.warning("config.yaml exists but cannot be read; treating memory.pre_memory_load_required as on")
         return True
-    return any(is_truthy_value(m.group(1), default=False)
-               for m in _PRE_MEMORY_LOAD_REQUIRED_LINE.finditer(text))
+    for line in text.splitlines():
+        if line.lstrip().startswith("#"):
+            continue
+        for m in _PRE_MEMORY_LOAD_REQUIRED_KEY.finditer(line):
+            if not _PRE_MEMORY_LOAD_REQUIRED_OFF.match(line, m.end()):
+                logger.warning("config.yaml could not be read cleanly and mentions "
+                               "memory.pre_memory_load_required; treating it as on (fix the config)")
+                return True
+    return False
 
 
 # Deduped: the gateway builds a fresh AIAgent per message, so it would warn every turn.
