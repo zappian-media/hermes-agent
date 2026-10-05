@@ -54,51 +54,6 @@ class MemoryLoadFailed(RuntimeError):
     swallowing it. Gate refusals raise ``hermes_cli.plugins.PreMemoryLoadBlocked``, not this."""
 
 
-# The raw fallback does not try to parse YAML values (flow style, anchors, aliases, tags, env vars,
-# quoted keys all defeat a value regex). Any uncommented mention of the key means required, unless
-# that mention is a plain explicit "off" value.
-# Whole key only (not my_pre_memory_load_required). Inline `# ...` text is NOT stripped: a `#` inside
-# a quoted value earlier on the line would then hide a real key, and a false "required" is the safe side.
-_PRE_MEMORY_LOAD_REQUIRED_KEY = re.compile(r"(?<![A-Za-z0-9_])pre_memory_load_required(?![A-Za-z0-9_])", re.IGNORECASE)
-_PRE_MEMORY_LOAD_REQUIRED_OFF = re.compile(
-    r"""["']?[ \t]*:[ \t]*["']?(?:false|no|off|0)["']?[ \t]*(?:[,}\]#]|$)""", re.IGNORECASE
-)
-
-
-def _memory_cfg_read_cleanly(cfg: Any) -> bool:
-    """False when ``cfg`` is a fallback for an unreadable config.yaml (``FailedConfigRead``, the
-    ``{}`` a failed load leaves) or its ``memory`` section is not a mapping: such a config cannot
-    say that ``pre_memory_load_required`` is off."""
-    from hermes_cli.config_read_errors import FailedConfigRead
-    if not isinstance(cfg, dict) or not cfg or isinstance(cfg, FailedConfigRead):
-        return False
-    return "memory" not in cfg or isinstance(cfg.get("memory"), dict)
-
-
-def _raw_config_requests_pre_memory_load() -> bool:
-    """Fail-closed reading of the profile's config.yaml text, for when the parsed config is not
-    trustworthy. True if any uncommented mention of ``pre_memory_load_required`` is anything but a
-    plain false/no/off/0, or the file exists but cannot be read. No file means required is off."""
-    from hermes_cli.config import get_config_path
-    try:
-        path = get_config_path()
-        if not path.exists():
-            return False
-        text = path.read_text(encoding="utf-8-sig", errors="replace")
-    except Exception:
-        logger.warning("config.yaml exists but cannot be read; treating memory.pre_memory_load_required as on")
-        return True
-    for line in text.splitlines():
-        if line.lstrip().startswith("#"):
-            continue
-        for m in _PRE_MEMORY_LOAD_REQUIRED_KEY.finditer(line):
-            if not _PRE_MEMORY_LOAD_REQUIRED_OFF.match(line, m.end()):
-                logger.warning("config.yaml could not be read cleanly and mentions "
-                               "memory.pre_memory_load_required; treating it as on (fix the config)")
-                return True
-    return False
-
-
 # Deduped: the gateway builds a fresh AIAgent per message, so it would warn every turn.
 _warned_unavailable_providers: set[tuple[str, str]] = set()
 
@@ -1399,22 +1354,13 @@ def _init_memory(agent, _agent_cfg, skip_memory, platform, memory_manager=None):
         # a block / raise / timeout must abort init on every surface before MEMORY.md is frozen.
         # Plugin discovery has already run, so a projection plugin's callback is registered.
         _memory_cfg_section = {}
-        _memory_cfg_trusted = True
-        try:
+        with suppress(Exception):
             from tools.memory_tool import get_builtin_memory_config as _get_builtin_memory_config
             _memory_cfg_section = _get_builtin_memory_config(_agent_cfg) or {}
-        except Exception:
-            _memory_cfg_trusted = False
         # is_truthy_value, not bool(): a quoted "false" / "no" / "0" must not enable required mode.
         _pre_memory_load_required = is_truthy_value(
             _memory_cfg_section.get("pre_memory_load_required"), default=False
         )
-        # A config that could not be read cleanly (fallback, failed load, malformed memory section)
-        # cannot vouch that required mode is off: decide from the file's own text, fail closed.
-        if not _pre_memory_load_required and not (
-            _memory_cfg_trusted and _memory_cfg_read_cleanly(_agent_cfg)
-        ):
-            _pre_memory_load_required = _raw_config_requests_pre_memory_load()
         from hermes_cli.plugins import (
             enforce_pre_memory_load_gate as _enforce_pre_memory_load_gate, has_hook as _has_plugin_hook,
         )
