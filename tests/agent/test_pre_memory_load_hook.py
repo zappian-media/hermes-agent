@@ -18,6 +18,7 @@ and BEFORE ``load_from_disk()``, dispatched OUTSIDE that ``try``:
 
 import ast
 import inspect
+import os
 import sys
 import threading
 from pathlib import Path
@@ -844,3 +845,75 @@ def test_review_fork_compaction_reruns_the_parents_gate(monkeypatch, hermes_home
     assert "fork stale" in str(exc.value)
     assert calls[-1] == calls[0], "fork must re-run the gate with the parent's exact payload"
     assert loads == []
+
+
+# ---------------------------------------------------------------------------
+# 8. Required mode survives a config that cannot be read cleanly (fail closed)
+# ---------------------------------------------------------------------------
+# agent_init read memory.pre_memory_load_required from the parsed config only. When config.yaml
+# could not be parsed (defaults or last-known-good fallback), when the load raised, or when the
+# memory section was malformed, required silently read False and, with no hook registered, the
+# gate was skipped. The file's own text now decides in those cases.
+
+_BROKEN_YAML = "memory:\n  pre_memory_load_required: true\n  memory_char_limit: [unclosed\n"
+
+
+def test_unparseable_config_that_requires_the_gate_aborts(monkeypatch, hermes_home):
+    (hermes_home / "config.yaml").write_text(_BROKEN_YAML, encoding="utf-8")
+    with pytest.raises(plugins_mod.PreMemoryLoadBlocked) as exc:
+        _make_agent(monkeypatch)
+    assert "required" in str(exc.value)
+
+
+def test_last_known_good_fallback_cannot_turn_required_off(monkeypatch, hermes_home):
+    from hermes_cli.config import load_config_readonly
+    _write_memory_config(hermes_home, pre_memory_load_required=False)
+    load_config_readonly()  # records the last-known-good copy (required off)
+    (hermes_home / "config.yaml").write_text(_BROKEN_YAML, encoding="utf-8")
+    with pytest.raises(plugins_mod.PreMemoryLoadBlocked):
+        _make_agent(monkeypatch)
+
+
+def test_failed_config_load_falls_back_to_the_file_text(monkeypatch, hermes_home):
+    _write_memory_config(hermes_home, pre_memory_load_required=True)
+
+    def _boom():
+        raise OSError("simulated config read failure")
+
+    monkeypatch.setattr("hermes_cli.config.load_config_readonly", _boom)
+    with pytest.raises(plugins_mod.PreMemoryLoadBlocked):
+        _make_agent(monkeypatch)
+
+
+def test_unreadable_config_file_fails_closed(monkeypatch, hermes_home):
+    if os.geteuid() == 0:
+        pytest.skip("root can read a mode-000 file")
+    cfg = hermes_home / "config.yaml"
+    _write_memory_config(hermes_home, pre_memory_load_required=False)
+    cfg.chmod(0)
+    try:
+        with pytest.raises(plugins_mod.PreMemoryLoadBlocked):
+            _make_agent(monkeypatch)
+    finally:
+        cfg.chmod(0o600)
+
+
+def test_unparseable_config_without_the_key_loads_memory_unchanged(monkeypatch, hermes_home):
+    (hermes_home / "config.yaml").write_text("memory:\n  memory_char_limit: [unclosed\n", encoding="utf-8")
+    agent = _make_agent(monkeypatch)
+    assert "task06-memory-line" in agent._memory_store.format_for_system_prompt("memory")
+
+
+def test_commented_out_required_line_is_ignored(monkeypatch, hermes_home):
+    (hermes_home / "config.yaml").write_text(
+        "memory:\n  # pre_memory_load_required: true\n  memory_char_limit: [unclosed\n", encoding="utf-8")
+    agent = _make_agent(monkeypatch)
+    assert agent._memory_store is not None
+
+
+def test_malformed_memory_section_cannot_hide_required(monkeypatch, hermes_home):
+    # `memory:` parses as a string, so the parsed section is {}; the raw line still asks for the gate.
+    (hermes_home / "config.yaml").write_text(
+        "memory: >\n  pre_memory_load_required: true\n", encoding="utf-8")
+    with pytest.raises(plugins_mod.PreMemoryLoadBlocked):
+        _make_agent(monkeypatch)
